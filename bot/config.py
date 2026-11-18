@@ -210,6 +210,17 @@ SELECTORS_MARKET_MOCK = {
     "market_price_cell":   "td.market-price-cell",
 }
 
+# ============ 本地配件价格缓存库 ============
+# 目标：同一 VIN + 零件编码在有效期内只查一次一车一件
+PRICE_CACHE_ENABLED = True          # 总开关（False = 完全回到无缓存行为）
+PRICE_CACHE_VALID_DAYS = 30         # 价格有效期（天），过期强制回源
+PRICE_CACHE_RETENTION_DAYS = 730    # 过期历史保留天数（用于回溯/趋势）
+PRICE_CACHE_DB_NAME = "price_cache.db"   # 存放于 data/ 目录
+
+# 查询端口优先级：第一个查不到再试下一个；未接入的端口会自动跳过
+PRICE_PROVIDER_ORDER = ("yicheyijian", "jingyou")
+
+
 # --- 真实外网一车一件（已按 一车一件.html 源码核对） ---
 SELECTORS_MARKET_REAL = {
     # VIN 首页

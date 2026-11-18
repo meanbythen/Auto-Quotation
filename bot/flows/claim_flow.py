@@ -34,6 +34,8 @@ from bot.page_objects import (
 from bot.routing import ROUTE_NORMAL, ROUTE_HIGH_AMOUNT, is_permission_error
 from bot.step_gate import StepGate
 from bot.models import BotRunResult
+from bot.pricing import get_price_service
+from bot.pricing.providers import get_providers
 
 STEP_NAMES = {
     "STEP 1": "首页 → 点击报案号",
@@ -508,49 +510,106 @@ async def run_claim_flow(env, ctx: dict, result: Optional[BotRunResult] = None,
         rec.mark("STEP 5", "skipped", reason="一车一件封禁冷却中")
         rec.mark("STEP 6", "skipped", reason="一车一件封禁冷却中")
     else:
-        # 标记本单真的访问了一车一件 → 案件间才需要冷却
-        ctx["market_touched"] = True
-        await env.market.go_home()
+        # ---------- 本地价格库：命中新鲜缓存就不查一车一件 ----------
+        price_svc = get_price_service()
+        remote_parts = target_parts
+        cached_parts: list = []
+        if price_svc.enabled:
+            price_svc.touch_vin(vehicle.vin)
+            remote_parts, cached_parts = price_svc.resolve(
+                vehicle.vin, target_parts,
+                tolerance=float(ctx.get("tolerance") or 0))
+            if cached_parts:
+                print(f"\n  💾 本地价格库命中 {len(cached_parts)}/{len(target_parts)} 件"
+                      f"（有效期 {cfg.PRICE_CACHE_VALID_DAYS} 天）→ 这些零件不再查一车一件")
+                log_audit(f"本地价格库命中 {len(cached_parts)}/{len(target_parts)} 件，"
+                          f"剩余 {len(remote_parts)} 件需远程查询")
 
-        async with rec.step("STEP 5", STEP_NAMES["STEP 5"]):
-            await gate.checkpoint("STEP 5 一车一件 → VIN 查询")
-            try:
-                await step_market_vin_search(env.market_page, ctx)
-            except Exception as exc:
-                if _is_market_ban(exc):
-                    print("  🛑 STEP 5 触发一车一件反爬熔断 → 跳过比价，全部以定损价提交")
-                    log_audit("STEP 5 反爬熔断 → 降级为定损价")
-                    ctx["skip_market_compare"] = True
-                elif await _skill_try("STEP 5", env.market_page, str(exc), ctx):
-                    await step_market_vin_search(env.market_page, ctx)
-                else:
-                    # 一车一件只是“比价”环节，出任何问题都不该让整个案件失败
-                    print(f"  ⚠️ STEP 5 一车一件异常（{type(exc).__name__}）→ 跳过比价，全部以定损价提交")
-                    log_audit(f"STEP 5 异常降级: {type(exc).__name__}: {exc}")
-                    ctx["skip_market_compare"] = True
-
-        # VIN 在一车一件查不到 / 触发反爬熔断 → 跳过整个比价环节，全部以定损价为准
-        if ctx.get("skip_market_compare"):
-            print(f"\n  ⚠️ 跳过一车一件比价 → 全部 {len(parts)} 件以定损价为准")
-            for p in parts:
-                p.market_price = None
-                p.within_market = None
+        if not remote_parts:
+            print(f"\n  ✅ 全部零件命中本地价格库 → 跳过 STEP 5/6，完全不访问一车一件")
+            log_audit("全部零件命中本地价格库 → 跳过一车一件（含 VIN 查询）")
+            rec.mark("STEP 5", "skipped", reason="全部零件命中本地价格库")
+            rec.mark("STEP 6", "skipped", reason="全部零件命中本地价格库")
         else:
-            async with rec.step("STEP 6", STEP_NAMES["STEP 6"]) as st:
-                await gate.checkpoint(f"STEP 6 一车一件 → 逐个查询 {len(target_parts)} 个贵零件市场价")
+            providers = get_providers()
+            primary = providers[0]
+
+            # 标记本单真的访问了一车一件 → 案件间才需要冷却
+            ctx["market_touched"] = True
+            await env.market.go_home()
+
+            async with rec.step("STEP 5", STEP_NAMES["STEP 5"]):
+                await gate.checkpoint("STEP 5 一车一件 → VIN 查询")
                 try:
-                    await step_market_query_parts(env.market_page, ctx, parts=target_parts)
+                    await primary.query_vin(env.market_page, ctx)
                 except Exception as exc:
                     if _is_market_ban(exc):
-                        print("  🛑 STEP 6 触发一车一件反爬熔断 → 剩余零件以定损价提交")
-                        log_audit("STEP 6 反爬熔断 → 剩余零件降级为定损价")
-                    elif await _skill_try("STEP 6", env.market_page, str(exc), ctx):
-                        await step_market_query_parts(env.market_page, ctx, parts=target_parts)
+                        print("  🛑 STEP 5 触发一车一件反爬熔断 → 跳过比价，全部以定损价提交")
+                        log_audit("STEP 5 反爬熔断 → 降级为定损价")
+                        ctx["skip_market_compare"] = True
+                    elif await _skill_try("STEP 5", env.market_page, str(exc), ctx):
+                        await primary.query_vin(env.market_page, ctx)
                     else:
-                        print(f"  ⚠️ STEP 6 一车一件异常（{type(exc).__name__}）→ 剩余零件以定损价提交")
-                        log_audit(f"STEP 6 异常降级: {type(exc).__name__}: {exc}")
-                result.market_queries_count = sum(1 for p in target_parts if p.market_price is not None)
-                st.detail["queries"] = result.market_queries_count
+                        # 一车一件只是“比价”环节，出任何问题都不该让整个案件失败
+                        print(f"  ⚠️ STEP 5 一车一件异常（{type(exc).__name__}）→ 跳过比价，全部以定损价提交")
+                        log_audit(f"STEP 5 异常降级: {type(exc).__name__}: {exc}")
+                        ctx["skip_market_compare"] = True
+
+            # VIN 在一车一件查不到 / 触发反爬熔断 → 跳过整个比价环节，全部以定损价为准
+            if ctx.get("skip_market_compare"):
+                print(f"\n  ⚠️ 跳过一车一件比价 → 全部 {len(parts)} 件以定损价为准")
+                for p in parts:
+                    p.market_price = None
+                    p.within_market = None
+            else:
+                async with rec.step("STEP 6", STEP_NAMES["STEP 6"]) as st:
+                    await gate.checkpoint(
+                        f"STEP 6 一车一件 → 逐个查询 {len(remote_parts)} 个贵零件市场价")
+                    try:
+                        await primary.query_parts(env.market_page, ctx, parts=remote_parts)
+                    except Exception as exc:
+                        if _is_market_ban(exc):
+                            print("  🛑 STEP 6 触发一车一件反爬熔断 → 剩余零件以定损价提交")
+                            log_audit("STEP 6 反爬熔断 → 剩余零件降级为定损价")
+                        elif await _skill_try("STEP 6", env.market_page, str(exc), ctx):
+                            await primary.query_parts(env.market_page, ctx, parts=remote_parts)
+                        else:
+                            print(f"  ⚠️ STEP 6 一车一件异常（{type(exc).__name__}）→ 剩余零件以定损价提交")
+                            log_audit(f"STEP 6 异常降级: {type(exc).__name__}: {exc}")
+
+                    # 主端口结果落库（只存有效价）
+                    if price_svc.enabled:
+                        n = price_svc.save(vehicle.vin, remote_parts, source=primary.name)
+                        if n:
+                            print(f"  💾 已写入本地价格库 {n} 条（来源：{primary.label}）")
+                            log_audit(f"写入本地价格库 {n} 条（source={primary.name}）")
+
+                    # 备用端口：主端口查不到的零件再试下一家（当前仅预留）
+                    for extra in providers[1:]:
+                        left = [p for p in remote_parts if p.market_price is None]
+                        if not left:
+                            break
+                        before = {id(p): p.market_price for p in left}
+                        try:
+                            await extra.query_parts(env.market_page, ctx, parts=left)
+                        except Exception as exc2:
+                            print(f"  ⚠️ 备用端口 {extra.label} 查询异常"
+                                  f"（{type(exc2).__name__}）→ 保持定损价")
+                            log_audit(f"备用端口 {extra.label} 异常: "
+                                      f"{type(exc2).__name__}: {exc2}")
+                            continue
+                        newly = [p for p in left
+                                 if p.market_price is not None
+                                 and before.get(id(p)) is None]
+                        if newly:
+                            price_svc.save(vehicle.vin, newly, source=extra.name)
+                            print(f"  💾 备用端口 {extra.label} 补查 {len(newly)} 件并写入本地库")
+
+                    result.market_queries_count = sum(
+                        1 for p in remote_parts if p.market_price is not None)
+                    st.detail["queries"] = result.market_queries_count
+                    if cached_parts:
+                        st.detail["cache_hits"] = len(cached_parts)
 
     over_parts = [p for p in parts if p.within_market is False]
     ok_parts = [p for p in parts if p.within_market is True]
