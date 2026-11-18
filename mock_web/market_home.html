@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>一车一件查询 · 明觉科技 - 首页</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Microsoft YaHei", Arial, sans-serif; background: #f4f5f7; color: #333; }
+
+  /* 顶部栏 —— 跟真实明觉科技对齐 */
+  .top-bar { background: #2b2b2b; color: #fff; padding: 10px 32px; display: flex; align-items: center; justify-content: space-between; }
+  .top-bar .brand { font-size: 16px; font-weight: bold; display: flex; align-items: center; gap: 8px; }
+  .top-bar .brand .logo-text { color: #e8a020; }
+  .top-bar nav a { color: #bbb; text-decoration: none; margin-left: 24px; font-size: 13px; }
+  .top-bar nav a:hover { color: #fff; }
+  .top-bar .user-area { display: flex; gap: 16px; align-items: center; font-size: 13px; }
+  .top-bar .user-area button { background: #e8a020; color: #000; border: none; padding: 4px 14px; border-radius: 3px; font-size: 12px; cursor: pointer; }
+
+  /* Hero区 —— 橙色渐变大背景 */
+  .hero {
+    background: linear-gradient(135deg, #ff7a1a, #f7931e, #e8a020);
+    padding: 60px 32px 80px;
+    text-align: center;
+    color: #fff;
+  }
+  .hero h1 { font-size: 14px; font-weight: normal; margin-bottom: 24px; opacity: .9; letter-spacing: 2px; }
+
+  /* VIN 大搜索框 */
+  .search-card {
+    max-width: 680px;
+    margin: -40px auto 40px;
+    background: #fff;
+    border-radius: 8px;
+    box-shadow: 0 4px 20px rgba(0,0,0,.12);
+    overflow: hidden;
+  }
+  .search-tabs { display: flex; border-bottom: 1px solid #eee; }
+  .search-tab {
+    flex: 1; padding: 16px; text-align: center; cursor: pointer;
+    font-size: 15px; color: #666; border-bottom: 3px solid transparent;
+  }
+  .search-tab.active { color: #e8a020; border-bottom-color: #e8a020; font-weight: bold; }
+
+  .search-body { padding: 24px 32px; display: flex; gap: 12px; align-items: center; }
+  .search-body input {
+    flex: 1; padding: 14px 16px; border: 1px solid #ddd; border-radius: 4px;
+    font-size: 18px; font-family: Consolas, monospace; letter-spacing: 1px;
+  }
+  .search-body input:focus { outline: none; border-color: #e8a020; box-shadow: 0 0 0 3px rgba(232,160,32,.15); }
+  .search-body button {
+    background: #e8a020; color: #fff; border: none; padding: 14px 40px;
+    border-radius: 4px; font-size: 16px; cursor: pointer; font-weight: bold;
+  }
+  .search-body button:hover { background: #d68910; }
+  .search-tip { padding: 0 32px 20px; font-size: 12px; color: #999; }
+
+  /* 可查询品牌展示 */
+  .brand-section { max-width: 1000px; margin: 20px auto 60px; }
+  .brand-section h3 { text-align: center; font-size: 14px; color: #888; font-weight: normal; margin-bottom: 24px; position: relative; }
+  .brand-section h3::before, .brand-section h3::after { content: ''; display: inline-block; width: 80px; height: 1px; background: #ddd; vertical-align: middle; margin: 0 16px; }
+  .brand-grid { display: grid; grid-template-columns: repeat(10, 1fr); gap: 16px 20px; padding: 0 24px; }
+  .brand-item { text-align: center; font-size: 12px; color: #666; }
+  .brand-icon {
+    width: 48px; height: 48px; background: #fff; border-radius: 50%;
+    margin: 0 auto 6px; display: flex; align-items: center; justify-content: center;
+    font-size: 20px; box-shadow: 0 1px 3px rgba(0,0,0,.08);
+  }
+</style>
+</head>
+<body>
+
+<div class="top-bar">
+  <div class="brand">
+    <span class="logo-text">明觉科技</span>
+    <span>DATA.ENLIGHTEN</span>
+  </div>
+  <nav>
+    <a href="#">配件查询</a>
+    <a href="#">参数配置</a>
+    <a href="#">极速控价</a>
+    <a href="#">关于明觉</a>
+    <a href="#">联系我们</a>
+  </nav>
+  <div class="user-area">
+    <a href="#">API接口文档</a>
+    <a href="#">付费升级</a>
+    <button>登录/注册</button>
+  </div>
+</div>
+
+<div class="hero">
+  <h1>一车一件 · 精准配件查询平台</h1>
+</div>
+
+<div class="search-card" id="search-card">
+  <div class="search-tabs">
+    <div class="search-tab active" data-tab="vin">VIN</div>
+    <div class="search-tab" data-tab="oe">OE号</div>
+  </div>
+  <div class="search-body">
+    <input type="text" id="vin-input" placeholder="请输入 VIN 码（17位车架号）查询车辆信息和配件市场参考价" autocomplete="off">
+    <button id="vin-search-btn">查询</button>
+  </div>
+  <div class="search-tip">ℹ️ VIN码（车架号）位于行驶证/驾驶员侧挡风玻璃下方，共17位字符</div>
+</div>
+
+<div class="brand-section">
+  <h3>我可查询的品牌</h3>
+  <div class="brand-grid" id="brand-grid"></div>
+</div>
+
+<script>
+// Tab 切换
+document.querySelectorAll('.search-tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.search-tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    const isVin = tab.dataset.tab === 'vin';
+    document.getElementById('vin-input').placeholder = isVin
+      ? '请输入 VIN 码（17位车架号）查询车辆信息和配件市场参考价'
+      : '请输入 OE 号（原厂零件编码）查询配件';
+  });
+});
+
+// URL 参数预填（可选）
+const params = new URLSearchParams(location.search);
+if (params.get('vin')) {
+  document.getElementById('vin-input').value = params.get('vin');
+}
+
+// 查询按钮 → 跳转到详情页
+document.getElementById('vin-search-btn').addEventListener('click', doVinSearch);
+document.getElementById('vin-input').addEventListener('keydown', e => { if (e.key === 'Enter') doVinSearch(); });
+
+function doVinSearch() {
+  const vin = document.getElementById('vin-input').value.trim().toUpperCase();
+  if (!vin) { alert('请输入 VIN 码'); return; }
+  location.href = 'market_detail.html?vin=' + encodeURIComponent(vin);
+}
+
+// 渲染品牌网格
+const brands = ['阿尔法·罗密欧','阿维塔','埃安','爱驰','奥迪','保时捷','宝骏','宝龙','宝马','宝沃','北京','北汽','比速','奔驰','奔腾','本田','比亚迪','宾利','大乘','大迪','大通','大众','道奇','东风','东风小康','东风风度','东南','雷克萨斯','雷诺','路虎','领克','零跑','陆风','玛莎拉蒂','迈凯伦','迈巴赫','远程','迷你','摩拜','纳智捷','欧宝','讴歌','欧拉','欧朗','奇瑞','起亚','前途','日产','荣威','如虎','赛力斯','三菱','双龙','斯巴鲁','斯柯达','斯威','特斯拉','腾势','万国','沃尔沃','WEY','五菱','五十铃','夏利','小鹏','新特','鑫源','星途','威马','蔚来','理想','永源','英菲尼迪','英致','中兴','中华','中顺','众泰','中国重汽','知豆','智己','智界','中国一汽','中华','北汽新能源','赛力斯SF5','吉利'];
+const icons = ['🚗','🚘','🏎️','🚙','🏁','🚐','🚚','🚛','🚜','🏍️'];
+const grid = document.getElementById('brand-grid');
+brands.slice(0, 80).forEach((b, i) => {
+  grid.insertAdjacentHTML('beforeend', `
+    <div class="brand-item">
+      <div class="brand-icon">${icons[i % icons.length]}</div>
+      <div>${b}</div>
+    </div>
+  `);
+});
+</script>
+</body>
+</html>

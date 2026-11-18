@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>任务中心 - 平级移交</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Microsoft YaHei", Arial, sans-serif; background: #f0f2f5; color: #333; }
+  .header { background: linear-gradient(135deg, #1a5276, #2d6cb5); color: #fff; padding: 10px 24px; display: flex; align-items: center; justify-content: space-between; }
+  .header-logo { font-size: 16px; font-weight: bold; }
+  .breadcrumb { background: #fff; padding: 10px 24px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #666; }
+  .breadcrumb a { color: #2d6cb5; text-decoration: none; }
+  .container { padding: 16px 24px; max-width: 1200px; margin: 0 auto; }
+  .section { background: #fff; border-radius: 6px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+  .section-header { padding: 14px 20px; border-bottom: 1px solid #eee; font-weight: bold; color: #444; }
+  .section-body { padding: 16px 20px; }
+  .search-row { display: flex; align-items: center; gap: 12px; }
+  .search-row label { color: #666; font-size: 13px; }
+  .search-row input { padding: 8px 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 13px; width: 260px; }
+  .search-row button { padding: 8px 24px; border-radius: 4px; border: none; background: #2d6cb5; color: #fff; cursor: pointer; font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { background: #f8f9fa; padding: 10px; text-align: left; border-bottom: 2px solid #ddd; color: #666; }
+  td { padding: 10px; border-bottom: 1px solid #f0f0f0; }
+  .transfer-btn { padding: 4px 14px; border: 1px solid #2d6cb5; background: #fff; color: #2d6cb5; border-radius: 3px; cursor: pointer; font-size: 12px; }
+  .transfer-btn:hover { background: #eef3fb; }
+  .empty-state { text-align: center; color: #999; padding: 32px; font-size: 13px; }
+  .modal-mask { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 200; justify-content: center; align-items: center; }
+  .modal-mask.show { display: flex; }
+  .modal { background: #fff; border-radius: 8px; width: 620px; padding: 0; }
+  .modal h3 { padding: 16px 20px; border-bottom: 1px solid #eee; font-size: 16px; }
+  .modal-body { padding: 20px; }
+  .modal-body table { margin-bottom: 16px; }
+  .modal-body input, .modal-body select { width: 100%; padding: 8px 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 13px; }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 10px; padding: 14px 20px; border-top: 1px solid #eee; }
+  .modal-actions button { padding: 8px 20px; border-radius: 4px; border: 1px solid #ddd; background: #fff; cursor: pointer; font-size: 13px; }
+  .modal-actions button.primary { background: #2d6cb5; color: #fff; border-color: #2d6cb5; }
+  .result-toast { display: none; position: fixed; left: 50%; top: 90px; transform: translateX(-50%);
+    padding: 12px 24px; border-radius: 6px; font-size: 14px; z-index: 300;
+    background: #eafaf1; color: #1e8449; border: 1px solid #27ae60; box-shadow: 0 4px 14px rgba(0,0,0,.12); }
+  .result-toast.show { display: block; }
+</style>
+</head>
+<body>
+
+<div class="header"><div class="header-logo">PICC · 车险理赔 · 任务中心</div></div>
+<div class="breadcrumb">
+  <a href="index.html">门户首页</a> / 车险理赔 / 任务中心 / <span>平级移交</span>
+</div>
+
+<div class="container">
+  <div class="section">
+    <div class="section-header">平级移交 · 查询</div>
+    <div class="section-body">
+      <div class="search-row">
+        <label>报案号</label>
+        <input id="transfer-claim-input" placeholder="请输入报案号" autocomplete="off">
+        <button id="transfer-query-btn">查询</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header">查询结果</div>
+    <div class="section-body">
+      <table>
+        <thead>
+          <tr>
+            <th>报案号</th><th>车牌号</th><th>当前处理人</th><th>任务状态</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="transfer-result-tbody">
+          <tr><td colspan="5" class="empty-state">请输入报案号后点击「查询」</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- 任务提交弹窗 -->
+<div class="modal-mask" id="task-submit-modal" data-modal="task-submit">
+  <div class="modal">
+    <h3>任务提交</h3>
+    <div class="modal-body">
+      <table>
+        <thead><tr><th>任务名称</th><th>目标小组</th><th>目标人员</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>九级报价</td>
+            <td>
+              <select id="transfer-group-select">
+                <option>本人所属小组</option>
+                <option>上级审核小组</option>
+              </select>
+            </td>
+            <td>
+              <input id="transfer-target-input" placeholder="请输入目标人员（工号-姓名）">
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <div style="font-size:12px;color:#888">提示：目标人员填写本人「工号-姓名」，提交后任务回到本人名下，可重新执行报价完成。</div>
+    </div>
+    <div class="modal-actions">
+      <button onclick="hideModal()">取消</button>
+      <button class="primary" id="submit-task-btn">提交任务</button>
+    </div>
+  </div>
+</div>
+
+<div class="result-toast" id="transfer-toast"></div>
+
+<script>
+  let currentClaim = '';
+  const tbody = document.getElementById('transfer-result-tbody');
+
+  document.getElementById('transfer-query-btn').addEventListener('click', doQuery);
+
+  function doQuery() {
+    const claim = document.getElementById('transfer-claim-input').value.trim();
+    if (!claim) {
+      tbody.innerHTML = '<tr><td colspan="5" class="empty-state">请输入报案号后点击「查询」</td></tr>';
+      return;
+    }
+    const transferred = localStorage.getItem('claim_superior_' + claim) === '1';
+    if (!transferred) {
+      tbody.innerHTML = '<tr><td colspan="5" class="empty-state">未查询到该报案号的待移交任务</td></tr>';
+      return;
+    }
+    currentClaim = claim;
+    tbody.innerHTML = `
+      <tr>
+        <td>${claim}</td>
+        <td>京CQ3PW6</td>
+        <td>上级审核小组</td>
+        <td>待接收 · 已转出</td>
+        <td><button class="transfer-btn" onclick="openModal()">移交</button></td>
+      </tr>`;
+  }
+
+  function openModal() {
+    // 默认带入常用本人信息，机器人会覆盖为配置值
+    document.getElementById('transfer-target-input').value = '17247339-胡晨光';
+    document.getElementById('task-submit-modal').classList.add('show');
+  }
+
+  function hideModal() {
+    document.getElementById('task-submit-modal').classList.remove('show');
+  }
+
+  document.getElementById('submit-task-btn').addEventListener('click', () => {
+    const target = document.getElementById('transfer-target-input').value.trim();
+    if (!target) {
+      alert('请填写目标人员（工号-姓名）');
+      return;
+    }
+    // 标记：任务已转回本人名下，报价页允许再次「报价完成」
+    localStorage.setItem('claim_level_up_' + currentClaim, '1');
+    localStorage.setItem('claim_owner_' + currentClaim, target);
+    localStorage.removeItem('claim_superior_' + currentClaim);
+    hideModal();
+    showToast(`任务提交成功，报案号 ${currentClaim} 已转回本人（${target}）`);
+    doQuery();
+  });
+
+  function showToast(text) {
+    const toast = document.getElementById('transfer-toast');
+    toast.textContent = text;
+    toast.className = 'result-toast show';
+  }
+</script>
+</body>
+</html>

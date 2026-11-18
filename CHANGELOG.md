@@ -1,0 +1,836 @@
+# 理赔报价机器人 更新日志
+
+当前版本：**v3.15.8**（提交路径选择加固：多候选控件 + 键盘兜底 + 失败诊断落盘）
+
+## v3.15.8 · 2026-11-18 · 提交上级仍卡『二级报价』：提交路径选择改为多候选控件 + 键盘兜底 + 失败现场落盘
+
+- 【问题】生产环境提交上级仍停在提交路径默认值『二级报价』，原实现只按 label 定位一个 el-select，label 文案/结构一旦与预期不同就直接失败
+- 【修复1】label 匹配改为两轮：先全量精确匹配，再包含匹配（兼容『提交路径选择（必填）』这类带后缀文案）；组别/人员等字段仍优先精确匹配，不受影响
+- 【修复2】新增候选控件枚举：读取『报价任务提交』弹窗内全部可见 el-select 的标签/当前值/禁用状态，按『标签含提交路径 → 当前值=二级报价 → 其它路径值』排序逐个尝试；明确排除『当前任务环节』和 disabled 控件，避免点错只读字段
+- 【修复3】打开下拉新增 DOM click 兜底；选项点击新增键盘兜底（↓ 逐项高亮，文字完全相等后回车），应对浮层遮挡/JS 点击无效
+- 【修复4】报价完成/提交上级选不中目标路径时改为抛错中断，不再带着默认『二级报价』继续提交
+- 【修复5】失败时自动落盘诊断：弹窗文本、弹窗内 el-select 清单、当前可见下拉项写入 audit 日志，并保存页面 HTML + 截图到日志目录（submit_path_fail_时间戳.*），可直接回传定位
+- 【验证】离线 Element UI 仿真：label 带后缀命中、label 不匹配时按当前值找回、已选幂等、候选枚举标签/值/禁用状态 共 6 项全部 PASS；compileall 0 错误
+
+## v3.15.7 · 2026-11-18 · 报价完成提交路径：取消过直供价 / 报价汇总与定损汇总换件金额不一致 → 选『车辆定损』
+
+- 【场景】改过直供价的报案号（切换价格类型取消直供价）以及改过报价的报案号，报价汇总的换件金额与定损汇总不一致，报价完成时若仍走默认/一级车辆核损，平台不会同步换件金额
+- 【新增判断】step_quote_finalize 提交前读取『金额汇总』里 定损汇总 / 报价汇总 两行的『换件金额』（Vue div 网格 + 老 table 双结构），差值 > 0.01 元即视为不一致
+- 【提交路径规则】以下任一成立 → 提交路径选『车辆定损』：① 本单改过报价（有 fixed_price）；② 本单取消过直供价（context.direct_supply_cancelled）；③ 报价汇总换件金额 ≠ 定损汇总换件金额
+- 【兜底】两项金额没有同时读到 → 不做一致性判断，保持原规则（无核损汇总→一级车辆核损；有核损汇总→系统默认）
+- 【日志】打印『换件金额不一致：报价汇总 ¥x ≠ 定损汇总 ¥y → 需回车辆定损同步』，并在提交路径决策处写明命中原因
+- 【验证】决策矩阵 8 组用例 PASS；两种金额汇总 DOM 结构（cxlp div 网格 / table）读取 PASS，无金额块返回 None PASS；compileall 0 错误；流程图 n_final 说明已同步刷新
+
+## v3.15.6 · 2026-11-17 · 修复：提交上级时『报价任务提交』弹窗定位不到提交路径控件，整单被跳过
+
+- 【现象】11-17 10:04 RDAA2026110000N0544060 换件金额 ¥74,997.75 已正确识别并选『提交上级』，但点击提交后报『未找到提交路径选择控件』，案件被跳过
+- 【根因】step_quote_submit_superior 用的是旧 mock 的 id/name 选择器（#task-path-input / input[name='submitPath'] / input[placeholder*='提交路径']），生产『报价任务提交』弹窗里提交路径、组别代码都是 Element UI el-select，没有这些属性
+- 【修复1】提交路径改用普通报价流程同一个 _quote_pick_submit_path：按表单项文字定位 .el-input，点开下拉在 body 层选『九级报价』；找不到只告警并保持系统默认，不再中断整单
+- 【修复2】组别代码增加兜底定位 .el-form-item:has-text('组别代码') input，仍按『填 1100000000005175-市公司报价组 → 失败改填 5175 选含市公司报价组且不含废弃的项』执行
+- 【修复3】弹窗等待改用 _quote_wait_submit_dialog（与普通流程一致，识别 aria-label=报价任务提交）
+- 【验证】模拟生产弹窗结构实测：提交路径 → 九级报价、组别代码 → 1100000000005175-市公司报价组，PASS；compileall 零错误
+
+## v3.15.5 · 2026-11-17 · 修复：换件金额超 4 万读不到金额导致不提交上级；提交上级卡在意见步骤 30 秒超时
+
+- 【现象】换件金额 >4 万的报案号仍按『报价完成』提交，被系统提示『已本地化操作总金额大于等于40000，请提交上级』拒绝；即使进入补救分支，STEP 9a 也报 Timeout 30000ms 跳过
+- 【根因1】生产『金额汇总』是 Vue div 网格（.cxlp-thead 表头 + .cxlp-tbody 行），不是 <table>；旧脚本只遍历 table → 每单都打印『未读到金额汇总 → 不做高额判断』，高额分支从未真正生效
+- 【根因2】STEP 9a 第 2 步『意见』用原生 select_option 操作生产页面的意见控件，页面上没有匹配的原生 select/可见文本框 → 白等 30 秒超时，提交上级整单失败
+- 【修复1·取数】金额汇总 JS 增加 div 网格解析：按 .cxlp-thead 子列定位『换件金额』列（排除『直供换件金额汇总』），在 .cxlp-tbody 中取『报价汇总』行；单元格含 disabled input 时读 value（修理金额列），table 结构保留兜底
+- 【修复2·意见】改为：原生下拉可见且确实含该选项才 select_option（4s 超时），否则写意见文本框（5s 超时），都失败只告警不阻断提交上级
+- 【验证】生产报价页快照实测：读到 报价汇总.换件金额 = ¥275.50（列号 1，div 网格），字段结构 ['', 换件金额, 维修金额（工时费）, 辅料费（材料费）, 管理费, 合计, 直供换件金额汇总, ...]；compileall 零错误
+
+## v3.15.4 · 2026-11-17 · 新增：换件金额超 4 万的报案号二次处理，提交上级后走快速链接『处理』直接报价完成
+
+- 【场景】同一报案号换件金额 >4 万：首轮已提交上级并平级移交；二次处理时业务动作再选『提交上级』会弹『系统提示 → 工作流提交成功』，下方快速链接专栏有『九级报价 + 报案号 + 处理』
+- 【修复】二次处理（reprocess）命中高额分支时，提交上级成功后自动定位快速链接专栏并点『处理』：弹出新标签页或当前页刷新都支持，回到本人的报价处理页（九级报价环节）
+- 【修复】点回报价页后不再平级移交，直接业务动作选『报价完成』→ 提交任务；提交路径保持系统默认（九级报价环节由平台决定）
+- 【兜底】若页面上找不到『快速链接专栏 → 处理』按钮，自动退回首轮路径（平级移交回本人后再报价完成），保证案件不中断
+- 【定位策略】取同时包含『快速链接专栏』标题和『处理』按钮的最小容器，避免误点页面上其它『处理』按钮
+- 【验证】用模拟系统提示弹窗验证：正确点中专栏内『处理』，页面其它『处理』按钮不受影响；compileall 零错误
+
+## v3.15.3 · 2026-11-17 · 修复：报案号处理过一次后再扫出来就被永久跳过，导致二次核价案件无人处理
+
+- 【现象】同一报案号第二次出现在首页未处理列表时，挂机循环直接跳过，不再处理；业务上这类二次案件只需全选同步定损后直接提交即可
+- 【根因】挂机循环用 processed_set 永久记住已处理过的报案号，只要出现过一次，之后每轮扫描都被过滤掉
+- 【修复1·循环】processed_set 改为按次数计数（processed_counts），同一报案号最多处理 2 次：首次走完整流程，第二次仍会被选中，达到 2 次后才移出待办；重启程序计数清零
+- 【修复2·流程】新增 reprocess 分支：第二次处理只做 STEP 1 首页点报案号 → STEP 2 打开定损平台 → STEP 3 全选复选框 + 同步定损 → STEP 8 提交定损单 → STEP 9 报价完成/提交任务，跳过 STEP 4~7（不提取比价、不查一车一件、不改价）
+- 【保留】STEP 8 失败仍继续走报价提交；STEP 9 沿用金额超 4 万提交上级/九级报价去重逻辑；工作记录仍写一行，零件清单读取失败不影响提交
+- 【验证】模拟首页始终返回同一报案号：第 1 次 reprocess=False 走完整流程，第 2 次 reprocess=True 走简化流程，均正常完成；compileall 零错误
+
+## v3.15.2 · 2026-11-13 · 修复：改价公式分子取成指导价，算出的新报价高于平台原报价，被平台重算回去
+
+- 【现象】报价列写入后回读值总比目标价低（14:09 期望 ¥2409 回读 ¥2231.46；15:21 期望 ¥1872 回读 ¥1832.08），看起来像平台在乱改，实际是程序把价格往上抬
+- 【根因】平台报价并不是指导价：生产快照同一行 estiLocalPrice=290、estiPartPrice(报价)=275.5、guidePrice(指导价)=290，报价 = 本地价 × 折扣(95%)。旧代码公式分子取 guidePrice，等于把“未打折的指导价”当定损价：2400×2540/2530=¥2409、1847.47×2057/2030=¥1872，都高于平台原报价 ¥2231.46 / ¥1832.08，平台按自身折扣把输入重置回原报价
+- 【修复1·取数】定损价改为优先取 data-lossobj.estiPartPrice（同步定损后的报价列，也是修复前的旧报价），其次 evalPartPrice，最后才兜底 guidePrice/msRetailPrice；guidePrice 只留作备查不参与公式
+- 【修复2·护栏】STEP 7 增加校验：公式结果必须低于平台原报价，否则打印『公式结果 ≥ 平台原报价 → 不下调，跳过改价』且不写入、不触发重新同步定损，避免把价格往上抬
+- 【正确结果】N0402860 机油控制阀：2400×2231.46/2530=¥2117（<原报价 2231.46）；N0548708 前半轴中间轴：1847.47×1832.08/2030=¥1667（<原报价 1832.08），均满足“新价一定低于旧报价”
+- 【验证】生产快照字段关系核对通过（报价/本地价=0.95）；两单真实数据公式重算均低于原报价；compileall 零错误
+
+## v3.15.1 · 2026-11-13 · 修复：有超市场价零件却没改成报价；定损平台开场『提示』窗未自动关
+
+- 【现象】工作记录里有超价数、改了报价=否。生产日志 14:09 RDAA2025110000N0402860、15:21 RDAA2026110000N0548708 均显示『报价写入后回读不符』→ 改价成功 0/1 → 按原定损价提交
+- 【根因】定损平台报价输入框在 change/blur 后会按自身公式重算（实测输入 ¥2409 回读 ¥2231.46、输入 ¥1872 回读 ¥1832.08，结果都低于目标价）。3.14.3 加的『必须与输入值相等』校验过严，把已经改成功的零件判成失败
+- 【修复】改为核对三件事：回读是有效数字、数值确实发生变化、且不高于目标价 2% 容差；满足即算改价成功。页面重算得更低属于平台正常行为，不再误判
+- 【新功能】定损平台一进入就自动弹出的『提示』窗（按钮『已阅知』）现在自动关闭：STEP 2 打开定损平台后关一次，STEP 3 同步定损前再关一次，避免遮罩挡住全选复选框和同步定损
+- 【验证】4 项专项测试 PASS：页面重算到更低值判成功、值未变化判失败、『已阅知』自动关闭、无弹窗时快速返回不误点；5 项改价回归、4 项高额分支、mock 全链路、compileall 全部通过
+
+## v3.15.0 · 2026-11-13 · STEP 9 新增分支：报价汇总换件金额超 4 万 → 提交上级（九级报价）→ 平级移交回本人
+
+- 【新增判断分支】定损单提交后回到报价处理页，STEP 9 先读『金额汇总 → 报价汇总 → 换件金额』；超过 ¥40000（config.HIGH_AMOUNT_THRESHOLD）不再尝试『报价完成』，直接业务动作选『提交上级』、意见『权限不够，报上级审核』
+- 【报价任务提交】提交路径选『九级报价』；组别代码输入 5175，下拉选『1100000000005175-市公司报价组』（自动排除带『废弃』的旧组），然后提交任务
+- 【平级移交】按生产菜单打开：理赔作业门户 → 左侧『车险理赔』→『任务中心』→『平级移交』；直连 http://10.164.128.92/claimcar/32170/taskTransfer/TaskTransferQuery 失败时自动改走菜单。报案号 + 任务类型『九级报价』→ 查询 → 点结果里的蓝色报案号 → 弹窗目标人员 17247339-胡晨光 → 提交任务
+- 【不重复提交】读取弹窗『当前任务环节』：已是『九级报价』说明本单提过上级并被转回，不再重复走提交上级，直接按基础流程报价完成
+- 【不按重复报案号跳过】高额案件提交上级/平级移交后该报案号会重新回到首页列表；若本轮收尾未完成，挂机流程不会把它当成『已处理』永久跳过，下一轮按新任务重试（最多 3 次）
+- 【兼容】mock 页面没有金额汇总与任务类型字段时自动跳过对应判断，原有权限不足补救链与 mock 全链路保持通过；4 项高额分支测试 PASS
+
+## v3.14.3 · 2026-11-13 · 修复：系统报了超市场价，但报价列写入失败，最终仍按原价提交
+
+- 【生产现象】RDAA2026110000N0546388 在 13:31 已正确算出前保险杠外皮应改为 ¥4520，但日志显示『报价单元格不可编辑』『改价成功 0/1』，随后按原定损价提交；当天 7 次自动改价全部因此失败
+- 【根因】生产换件表中『修理厂报价』(discountPriceBefore) 位于真正的『报价』(estiPartPrice) 之前；旧逻辑用 findIndex(/报价|定价|…/) 取第一个模糊命中，选中了没有可编辑 input 的修理厂报价列。『智能定价』是禁用输入框，也不是本次应修改的目标
+- 【修复】优先按 input[name=estiPartPrice] / input.partPrice 定位真实报价输入框，其次按 th[data-field=estiPartPrice]，最后才精确匹配『报价/换件报价/定损报价/核报价/审定价』表头；取消找不到报价列就改本地价的兜底
+- 【防误写】写入后回读数值，与目标价不符就判失败，不再只凭事件已触发就报成功；每次定位零件前清除上一行的 data-bot-target，避免连续改多个零件时写回第一行
+- 【验证】直接加载生产定损平台 DOM 快照：正确定位第 16 列报价而非第 6 列修理厂报价；N0546388 同构表格成功写入 ¥4520，智能定价/本地价/修理厂报价不变；连续两行改价及无报价列安全失败等 5 项 PASS；mock 全链路 5/5 改价并提交 PASS；compileall 零错误
+
+## v3.14.2 · 2026-11-12 · 修复：一个有直供价的报案号，把它后面所有报案号都带成『直供价有值』跳过
+
+- 【现象】17:00 后连续 7 个报案号（#2 RDZA…0550523 → #8 RDAA…0552401）提取出的零件编码/价格/直供价完全相同（尾灯 26549428、直供价 22/23/10/11/126），全部被 3.12.1 的『直供价有值』整案跳过
+- 【根因】STEP 2 里『定损平台标签页已打开 → 直接复用』的逻辑不区分是哪一单：直供价跳过的案件不会关标签页，下一单进来就把上一单的定损页当成本单页面复用，于是零件表、直供价、平台直供价全是上一单的残留数据（报案号是上下文兜底拿的，所以看起来是对的）
+- 【修复1·STEP 2】复用前先核对归属：新增 _loss_page_claim_state() 扫描定损页所有 frame 的报案号 —— 含本单才复用；只含别的报案号或读不到 → 关闭残留标签页后重新点『编辑』
+- 【修复2·STEP 4】data-lossobj 提取不再『取第一个命中的 frame』：逐 frame 比对文档内报案号，优先本单；只含别的报案号的 frame 直接排除；全部是残留数据时抛错并提示『拒绝按残留数据判断直供价』，不再静默跳过后续案件
+- 【验证】_loss_page_claim_state 6 项用例全 PASS（本单/上一单/读不到/含多单/无上下文/大小写）；mock 全链路回归 PASS（10 个零件正常比价→修复→提交）
+
+## v3.14.1 · 2026-11-12 · 控制台排版修复：左栏文字不再截断，右侧进度/日志收窄
+
+- 【问题】左列固定 420px、右列吃掉全部剩余宽度 → 左侧『运行状态/运行参数』的一行式说明文字被截断（如“元 低于此值的零件不查一车一件…”），右侧流程进度与日志过宽
+- 【布局】body 改用 grid，左右列 weight=4:6 且 uniform 锁定比例；默认窗口 1180x780 → 1320x860（1320 宽时左 477px / 右 735px）
+- 【流程进度】每行 5 个改 4 个（12 个 STEP 由 3 行 5 列改为 3 行 4 列），运行日志随右列宽度自适应
+- 【换行】左侧所有说明文字统一托管到 _wrap_labels：左列宽度变化时自动重算 wraplength（11 个标签），窗口缩放不再截断
+- 【重排】价格容忍度/本地价阈值/刷新间隔三行改为『标题+输入框』一行、说明文字另起一行缩进换行；封禁熔断等勾选项文案精简
+- 【版本卡】版本号只显示 vX.Y.Z（长标题原本被右侧三个按钮挤掉），完整更新说明保留在下方并自动换行
+- 【验证】Tkinter 实测：1180x780 / 1320x860 / 1440x960 三种尺寸下比例均为 0.39（≈4:6），单行说明被截断数 = 0；流程进度每行 4 个 PASS；缩窄窗口后 wraplength 同步更新 PASS
+
+## v3.14.0 · 2026-11-12 · 控制台新增『减速参数 / 查询配额』输入框：改完点开始扫描即生效
+
+- 【需求】调一车一件节奏时不想每次都改代码重新打包 → 参数搬到控制台
+- 【新增】控制台左栏 5 行输入：VIN 间隔 min~max（秒）、零件间隔 min~max（秒）、案件间冷却（秒）、10 分钟配额（次）、60 分钟配额（次）
+- 【生效方式】_apply_market_tuning() 在『开始挂机 / 开始扫描 / 单次运行』启动（含暂停后恢复）前把数值写进 bot.config，page_objects 每次查询都读最新值，改完无需重启程序
+- 【容错】min>max 自动交换；留空/非数字保留原值；配额填 0 = 不限（999999）
+- 【持久化】参数随 ui.json 保存/读取，下次启动仍是上次那套值
+- 【验证】Tkinter 实测 13 项 PASS：默认值、写入 cfg、min>max 交换、非法输入保留、配额 0=不限、切视图后输入框仍可用；实测 5 行宽度均 ≤228px（卡片 405px）无溢出
+
+## v3.13.4 · 2026-11-12 · 一车一件减速升到保守档（节点间隔从 1.8s 地板抬到 5s）
+
+- 【实测结论】生产日志 audit_20261112.log 显示减速设置确实生效（16:25:48 打印『速率限流=开 | 封禁熔断=开』），但零件查询实际间隔只有 3.2~3.9 秒 —— 因为限流只保证『不短于 1.8s』，而一次查询的自然耗时就已 3.2~4.0s，限流器几乎不加等待
+- 【参数】MARKET_PART_DELAY_MIN/MAX 由 1.8/3.8 → 5.0/9.0 秒；MARKET_VIN_DELAY_MIN/MAX 由 3.5/6.5 → 8.0/14.0 秒；MARKET_CLAIM_COOLDOWN 由 8 → 30 秒（±30% 抖动，实际 21~39 秒）
+- 【效果】同样 9 个贵零件的案件，比价环节从约 35 秒拉长到约 75~90 秒，整体接近慢速人工操作节奏
+- 【文案】控制台两个勾选项说明同步更新（速率限流 8~14s / 5~9s / ~30s；封禁熔断改为暂停一车一件 30 分钟）
+- 【验证】模拟上一次查询在 3.5s 前 → 零件补等 2.49s（区间 1.5~5.5s）PASS；VIN 2s 前 → 补等 6.38s（区间 6~12s）PASS；已超下限不额外等待 PASS；案件间冷却 30s±30%=21~39s PASS
+
+## v3.13.3 · 2026-11-12 · 修复：切到工作记录等模块再回控制台，『开始挂机/开始扫描』按钮被重置为初始态
+
+- 【问题】挂机扫描进行中，切到『工作记录』等模块再切回『控制台』，实际扫描仍在正常跑，但两个按钮都变回『▶ 开始挂机 / ▶ 开始扫描』的初始态，与真实运行状态不符
+- 【原因】切换视图会销毁并重建控制台页面，按钮是按初始文案新建的，重建后没有任何地方按当前运行状态重新上色
+- 【修复】_build_console_view 末尾调用 _update_button_states()，按 _loop_env / _scan_active / _pause_event 重新设置按钮文案、颜色与可用状态
+- 【验证】Tkinter 实测 4 种状态（初始 / 挂机+扫描中 / 挂机+暂停 / 浏览器已关闭）在『工作记录/日志中心/流程比对』来回切换后按钮文案与颜色全部正确，9 项断言 PASS
+
+## v3.13.2 · 2026-11-12 · 本地价阈值默认值 1000 → 2000
+
+- 【调整】控制台『本地价阈值』输入框默认值由 1000 改为 2000：低于 ¥2000 的零件不查一车一件，减少一车一件请求量，进一步降低封禁风险
+- 【不变】仍可手动改任意值，设 0 = 全部零件都查一车一件
+
+## v3.13.1 · 2026-11-12 · 一车一件防封：识别 [9016] 账号状态异常 + 滑动窗口配额 + 封禁期不再请求
+
+- 【实测封禁】2026-11-12 15:45–15:53 共 41 次零件查询 + 6 次 VIN 查询（单分钟峰值 8/11/10 次），15:53:35 最后一次成功；15:55:14 起页面返回『[9016]账号状态异常，请稍后再试』，程序把它当成『VIN 查不到』又补查了一次，等于在封禁期继续请求
+- 【识别】封禁关键词补『账号状态异常 / 账号异常 / 状态异常 / 请稍后再试 / 账号已锁定』；另加错误码正则 MARKET_BAN_CODE_PATTERN=\[\s*9\d{3}\s*\]，页面出现 [9016] 这类四位错误码即视为封禁（文案改版也能命中）
+- 【配额】新增滑动窗口配额：10 分钟内 ≤20 次、60 分钟内 ≤80 次（VIN + 零件合计），超限就地等待而非硬冲；可用 config 中 MARKET_QUOTA_* 调整
+- 【复检】VIN 点击查询后由『扫一次』改为轮询 5 次（每次间隔 0.6s），异步渲染的封禁提示不会再漏；封禁检测命中时日志打印命中词与上下文，便于事后核对
+- 【连续失败自保】连续 2 次 VIN 查询无结果 → 视为疑似封禁，直接暂停 30 分钟，不再打第三次；成功一次立即清零计数
+- 【封禁期降级】封禁冷却（MARKET_BAN_COOLDOWN=30 分钟）期间：claim_flow 在进入一车一件前就判定并跳过，本单及后续案件全部以定损价提交，完全不访问一车一件，避免延长封禁
+- 【不再阻塞】_market_rate_wait 命中封禁时改为抛『反爬封禁』异常（上层捕获后降级为定损价），不再原地 sleep 30 分钟把整轮挂机卡死
+- 【验证】9016/账号状态异常/过于频繁 5 组文案全部识别；正常页面（含『429元』『9016 号零件』）0 误判；配额 10 分钟/60 分钟两档触发等待 PASS；封禁期 _market_rate_wait 抛错 PASS；mock 全链路回归 PASS；compileall 0 错误
+
+## v3.13.0 · 2026-11-12 · 提交路径按『是否改过报价』优先判断
+
+- 【需求】本单在一车一件查询后对报价做过修改（有零件 fixed_price）→ 报价完成提交时必须走『车辆定损』，不管金额汇总有没有『核损汇总』行
+- 【逻辑】新增 _quote_decide_submit_path 统一决策，优先级：① 改价零件数 > 0 → 『车辆定损』；② 未改价 + 无核损汇总 → 『一级车辆核损』；③ 未改价 + 有核损汇总 → 保持系统默认（不动下拉）
+- 【数据来源】ctx['parts']（兼容 PartItem 对象与 _parts_snapshot 字典快照），fixed_price 非 None 即视为该零件改过价
+- 【日志】会打印命中哪条规则，例如：'[i] 本单改过报价（2 个零件）→ 提交路径必定选『车辆定损』（忽略核损汇总=True）'，并写审计日志
+- 【验证】决策矩阵 7 组用例 PASS（改价/未改价 × 有/无核损 × 对象/快照/空列表）；Playwright 实测下拉从『一级车辆核损』切到『车辆定损』成功并点提交任务；compileall 0 错误
+
+## v3.12.2 · 2026-11-12 · 『不属于本车』提示不再刷屏：等价值按正常处理
+
+- 【问题】真实挂机日志每条零件都在打印『[!] 查询的 OE 号不属于本车（定损选错配件）→ 属本车 OE 号价 ¥1530、¥1530，取最低非0价 ¥1530』。原因是页面对大多数查询都会显示『您查询的OE号不属于本车』这个标签，并不是真的选错配件
+- 【原因】上一版把每个 OE 价格都收进候选（含被查询的那个 OE），并一律标记 wrong_oe，导致相等价格也被当成‘选错配件’刷日志
+- 【修复】改为只取『属于本车』的 OE 价（跳过 is-requested 那个），取非0最低价；只有该价低于查询价时才判定 wrong_oe 并打印提示与审计日志。价格相同或更高时走正常逻辑，不打印任何额外提示
+- 【兜底】属本车的 OE 价全是 0 → 视为查不到市场价，以定损价为准
+- 【验证】Playwright 真实执行 PASS：8300/6800 → 6800 且改价；1530/1530 → 1530 且不提示；1500 查价 + 属本车 1250/0/980.5 → 980.5；属本车全 0 → 以定损价为准
+
+## v3.12.1 · 2026-11-12 · 定损选错配件：多 OE 号取非0最低价
+
+- 【场景】一车一件查询结果出现『您查询的OE号不属于本车』『属于本车的OE号』，说明定损选错了配件；同一行会有多个 OE 号各自的价格（截图实测 8,300.00 与 6,800.00，减损金额 1,500）
+- 【规则】这类结果里的价格全部收集，舍弃 0 值与空值，取『最低非0价』作为市场价参与比价；最终报价仍以定损价为上限（STEP 7 只在超市场价时下调，不会高于定损价）
+- 【实现】_JS_MARKET_PART_LIST_PRICE 增加 oePrices（逐个 .price-oe__inner 的 price/oe/is-requested）；_extract_market_price 先判 rowText 含『不属于本车』→ 返回 min(非0价) 且 wrong_oe=True；其余情况保持原逻辑（优先『属于本车』行）
+- 【日志】命中时打印：'[!] 查询的 OE 号不属于本车（定损选错配件）→ 属本车 OE 号价 ¥6,800、¥8,300，取最低非0价 ¥6,800'，并写审计日志
+- 【验证】Playwright 真实执行 PASS：① 8,300/6,800 → 取 6,800；② 0.00/1,250/0.00/980.5 → 取 980.5（0 值被丢弃）；mock 全链路回归 PASS；compileall 0 错误
+
+## v3.12.0 · 2026-11-12 · STEP 9：按金额汇总有无『核损汇总』决定提交路径
+
+- 【需求】定损平台提交定损单回到报价处理页后，如果『金额汇总』这一块里没有『核损汇总』行，走『一级车辆核损』；有这一行则保持系统默认路径
+- 【核对页面】提交路径下拉实际只有『车辆定损』『一级车辆核损』两项（用户 15:0x 更正：第二项是“核损”不是“报损”，也没有“一级车辆定损”）；金额汇总标题是 el-divider__text，行是 el-table 的 tr
+- 【新增】_quote_summary_has_hexun：定位文字正好是『金额汇总（可带冒号）』且真正渲染出来（有尺寸）的标题，向上找最多 6 层、包含『定损汇总/报价汇总』的那个块，再看块内是否出现『核损汇总』。隐藏 tab 里的同名块不参与判断
+- 【新增】_quote_pick_submit_path：先读 el-select 的 input.value，已是目标就跳过；否则点『提交路径选择』的 el-input，在 body 层 .el-select-dropdown:visible 里按文字精确点『一级车辆核损』；含原生 select 兜底，找不到选项时按 Esc 关闭下拉并保持默认
+- 【接入】step_quote_finalize 一开始就判断金额汇总 → 日志打印『金额汇总含/无核损汇总』；只在弹出的『报价任务提交』对话框里、点『提交任务』之前改路径，之后照旧点『提交任务』→ 等系统提示 → dismiss_all_modals 点『关闭当前窗口』
+- 【验证】Playwright 真实用例 PASS：① 可见金额汇总无核损汇总、隐藏 tab 里有一个 → 判定 False；② 可见块有核损汇总 → True；③ 下拉从『车辆定损』改为『一级车辆核损』成功；④ 已是目标值时不重复点开下拉
+- 【回归】mock 全链路 PASS（STEP 9 提交成功；mock 无该下拉时自动保持默认路径，不影响流程）；compileall 0 错误
+
+## v3.11.0 · 2026-11-12 · 直供价改为「同表同行」取值 + 处理『已阅知』提示框
+
+- 【问题 1】14:03 起 RDAA2026110000N0529616 确实有直供价、跳过正确，但之后 7 个没有直供价的报案号全部被跳过；日志里每单都打印『有数值 [\'150.00\', \'80.00\', \'100.00\', \'30.00\', \'100.00\']』，数值一字不差重复，说明读的不是本单零件表，而是上一单残留在 DOM 里的旧表格
+- 【根因】_scan_direct_supply_column 遍历 page.frames，返回第一个「有直供价列」的 frame —— 定损平台上一单的表格/iframe 没被销毁时，它就排在前面对，于是每单都读到同一份旧数据
+- 【修复】直供价不再单独扫页面，改为在提取零件的那次 JS 里，从同一个 <tr> 所属的 <table> 表头定位「直供价」列，再取本行对应单元格（与编码/名称/本地价严格同一行同一表）。支持 bootstrap-table 表头与表体分离（fixed-table-header / fixed-table-body）的结构
+- 【顺带】删除失效的 _pick_direct_supply_price / _JS_SCAN_DIRECT_SUPPLY_COL / _scan_direct_supply_column；表头只认『直供价/直供单价/直供价格』，含『非直供』的列一律排除
+- 【问题 2】定损平台弹出『提示』框（三类修理厂维修范围风险说明），只有一个『已阅知』按钮，程序不处理会导致后续点击被遮挡
+- 【修复】弹窗按钮文案加入『已阅知』（_CONFIRM_BTN_SELECTORS 与兜底 JS 的按钮文字正则），dismiss_all_modals 可直接点掉
+- 【验证】Playwright 真实用例 PASS：① 同表同行取到 ['150.00','','80.00'] 并解析为 [150,0,80]；② 当前单无直供价列、另有残留 iframe 带 150.00 → 判定为无直供价（不再误跳过）；③ 含『已阅知』按钮的提示框 1 次点击关闭
+
+## v3.10.0 · 2026-11-12 · 一车一件反爬判定加网络层：监听真实 HTTP 429
+
+- 【背景】只看页面文字有两个盲区：页面 DOM 正常但接口已经被限流；反过来页面里出现 429 数字又会误判。补上网络层监听，以真实响应状态码为准
+- 【新增】install_market_ban_listener：给一车一件页面挂 page.on('response')，记录状态码 429 的请求 URL 与时间；图片/样式/字体/媒体/脚本等静态资源 404/429 不计入，避免广告或图标请求误伤
+- 【新增】market_note_response / market_recent_http_ban / market_clear_http_ban：线程安全的环形记录（最多 20 条），只认最近 60 秒内的 429
+- 【判定顺序】_market_check_ban：先扫页面文本（中文封禁词 + 429 带上下文），再看网络层 60 秒内是否有 429。网络层命中打印『🚨 一车一件网络层限流：HTTP 429 → URL』并进入 16 分钟冷却；命中后记录清空，不会重复熔断
+- 【挂载时机】Environment.start() 仅对真实一车一件挂载（mock 不挂），每次启动清空旧记录；日志打印『🌐 已挂载一车一件网络监听（HTTP 429 → 熔断）』
+- 【验证】Playwright 真实拦截用例 PASS：文本里含『序号 429』但无网络 429 → 不熔断；图片 429 → 不记录；XHR 返回 429 → 记录并判定『HTTP 429』且进入冷却；命中后记录清零不重复触发；compileall 0 错误
+
+## v3.9.9 · 2026-11-12 · 封禁熔断误触发修复：429 必须带上下文才算封禁
+
+- 【问题】13:38:25 第 6 个零件还没开始查就触发『封禁』，随后主动冷却 847s（16 分钟）。排查确认不是一车一件真的封号：日志里 429 只出现 2 次、都是程序自己打印的，页面文本是正常的侧边栏/车辆信息/配件清单，没有任何站点封禁文案；847s 又正好等于本地 MARKET_BAN_COOLDOWN=16*60 的剩余时间
+- 【根因】MARKET_BAN_KEYWORDS 里直接放了『429』『rate limit』『Too Many Requests』，而判定是 body 全文裸包含匹配 —— 页面任何位置出现 429 三个数字（价格、序号、时间戳、隐藏文本）都会当成封禁，直接自锁 16 分钟
+- 【修复】新增 _market_ban_hit：中文关键词（防爬/禁用/封禁/验证码/过于频繁…）出现即命中；429 / rate limit / too many requests 这类指纹必须前后 40 字内出现『请求/频繁/错误/禁止/访问/超出/限制/异常/too many/limited/error/blocked/exceeded』才算，避免误熔断
+- 【日志】命中时打印关键词 + 前后文 100 字（换行转 ⏎），下次再触发可以直接看到到底是哪段文字命中的
+- 【补充关键词】新增『过于频繁』，覆盖『请求过于频繁，请稍后再试』这类真实限流文案
+- 【验证】7 组用例 PASS：页面里出现『订单号 429』『序号 429 本地价』不触发；『HTTP 429 Too Many Requests』『请求过于频繁』『触发防爬机制，禁用15分钟』『验证码』『rate limit exceeded』正常触发；compileall 0 错误
+
+## v3.9.8 · 2026-11-12 · 案件间冷却按「是否真的访问一车一件」判断
+
+- 【问题】本地价阈值前置生效后，有的报案号全部零件都低于阈值、根本没进一车一件，但案件处理完仍然触发了一车一件冷却，白等一段时间
+- 【修复】ctx 新增 market_touched 标记，每单开始为 False；只有真的进入一车一件（STEP 5/6）时才置 True。案件结束后的冷却改为按这个标记判断：没访问过一车一件 → 直接处理下一个报案号，日志打印『⚡ 本单未访问一车一件 → 免冷却』
+- 【覆盖范围】全部零件低于阈值、勾选『跳过查询零件价格』、以及 STEP 4 之前就失败/直供价跳过的案件，都不会再走一车一件冷却；真正访问过一车一件的案件冷却逻辑不变
+
+## v3.9.7 · 2026-11-12 · 直供价判定对齐「零件行」：同一行的直供价列才算数
+
+- 【问题】之前直供价是单独按表头/字段名扫的，和零件编码/名称/本地价不在同一处读取，判出来的『直供价』和页面上那一行显示的直供价不是一回事
+- 【修复 · 随零件行一起读】PartItem 新增 direct_supply_price 字段，直供价跟编码/名称/本地价/定损价一起从同一条零件数据里取；日志零件行也带上『直供价=¥x / —』，一眼能核对
+- 【修复 · 页面显示优先】提取完零件后先看页面零件列表里『直供价』这一列：整列为空或没有该列 → 本单没有直供价，正常比价；只有该列真的出现数值才跳过。页面没有该列时，才回退看 data-lossobj 的 directSupplyFlag 标记
+- 【日志】新增『[i] 页面「直供价」列: 存在但整列为空 → 本单正常比价』/『无「直供价」列 → 按 data-lossobj 直供标记判断』，下次真实运行可直接定位判定依据
+- 【验证】compileall 0 错误；mock 全链路回归 PASS（不误判直供、10 件正常比价提交）；表头严格匹配用例仍 PASS（非直供价 / 直供状态列不会误命中）
+
+## v3.9.6 · 2026-11-12 · 直供价误判修复 + 本地价阈值判断时序前置
+
+- 【根因 · 7 单全被跳过】data-lossobj 直供价是按关键词猜字段的，关键词里含 'directprice'：platDirectPrice（平台直供价，每个零件都有值）和 nonDirectPrice（非直供价）全被误当成『直供价有值』→ has_direct_supply=True → 第一个比价零件就判定整案『直供价比定损价低/相当』直接跳过。实际运行日志里 8 单中 7 单栽在这里，且四个零件的『直供价』155/137/137/675 每单完全相同，正是平台参考价而不是真实直供价
+- 【修复 · 以标记为准】直供判定改为：只有 directSupplyFlag 为真（1/Y/是/true）才继续看直供价，取 platDirectPrice / pzhigongPrice / directSupplyPrice 中第一个 >0 的值；nonDirectPrice（非直供价）永不参与判定
+- 【修复 · 表头只认独立列】原来的表头判定是 indexOf('直供')，会把『非直供价』『直供状态』『直供商』也算进去。现在表头归一化后必须正好是『直供价 / 直供单价 / 直供价格』，并显式排除含『非直供』的列（两个通道都改）
+- 【新增 · 诊断日志】读取零件后打印一行 [diag] 直供判定: directSupplyFlag / platDirectPrice / pzhigongPrice / nonDirectPrice，下一轮真实运行可直接核对字段含义
+- 【优化 · 本地价阈值前置】原来流程是：提取 VIN → 进一车一件查 VIN → 读零件列表 → 再按阈值筛选。现在改为：提取 VIN 和零件列表后先判断，没有零件 ≥ 阈值就不进一车一件、不查 VIN，直接提交定损单（STEP 5/6 标记为 skipped）；有贵零件才进一车一件，并且只查这些贵零件
+- 【验证】直供判定 8 组单元用例 PASS（flag=0/None/'0' 均不判直供；flag=1/Y/true 且价格>0 才判）；表头严格匹配 Playwright 验证 PASS（非直供价 / 直供状态 → 不命中；直供价空列 → 不命中；直供价有值 → 命中）；mock 全链路 PASS：阈值 1000 时 5 件便宜不查、5 件查询后正常改价提交；阈值极高（全部便宜）时 STEP 5/6 直接跳过、STEP 8 提交 + STEP 9 关闭提示全流程成功
+
+## v3.9.5 · 2026-11-12 · 学习纠错闭环：控制台「🧠 学习模式」+ 失败挂起 + 手动演示存技能 + 自动重放
+
+- 【之前的状态】只有后端骨架：skill_learning 变量、技能库 store/replay/hooks 都写了，但界面没有勾选框（永远 False），失败时也不会留下待学习记录，data/skills 为空 —— 等于完全没生效
+- 【新增 · 控制台勾选框】『运行参数』卡片新增『🧠 学习模式（某步失败时暂停，你手动处理后存成技能，下次自动重放）』，默认关闭；三个运行入口（挂机扫描 / 单步 / 老入口）都透传 skill_learning
+- 【新增 · 失败挂起】学习模式开启时，某个 STEP 抛异常且技能库救不了 → 不再直接跳过案件，而是在浏览器里注入录制器、程序挂起，控制台状态条亮起『💾 保存学习 / ⏭ 跳过本案件』；点『停止扫描』也会立刻退出挂起
+- 【新增 · 一键存技能】点『💾 保存学习』→ 取走这段时间录制到的点击/输入/下拉动作 → 生成技能 JSON（触发条件 = STEP + 页面路径 + 错误首行，验证条件 = 修复后页面路径）→ 存到 data/skills/，并立即重跑本步；没录到动作则不保存、只重跑
+- 【新增 · 跨线程桥】bot/skills/hooks.py 新增 LearnSession（线程安全）：GUI 主线程 decide(save/skip)，机器人协程 await wait() 轮询，兼容停止信号
+- 【修复 · 新技能永远匹配不上】技能置信度 = success/(success+failure+1)，新技能是 0 分 < 自动匹配阈值 0.3 → 死技能。现在人工演示存技能时记 success_count=1（置信度 0.5），下次才可能被自动重放
+- 【修复 · load_skill 只给 id 时加载失败】load_skill('20261112-…') 找的是没有 .json 后缀的路径 → 返回 None，导致 record_outcome 静默失效、技能成功/失败次数从不更新。修复：无后缀时自动补 .json
+- 【修复 · iframe 里的动作重放不到】录制器是按各 frame 的 document 生成 CSS path，而重放只在主页面找。修复：主页面找不到时遍历 iframe 再找
+- 【验证】离线自测 PASS：跨线程 save/skip 返回正确；3 条动作生成技能并被 match_skill 命中；无动作时不建技能。真实 Playwright 端到端 PASS：造一个『弹窗挡住输入框』的失败页 → 学习模式录下人工点『确定』→ 新页面同样进入失败状态 → 重放技能后弹窗自动关闭、verification_ok=true
+
+## v3.9.4 · 2026-11-12 · 一车一件「车辆信息」「配置差异项」弹窗彻底修好（三个叠加 bug）
+
+- 【bug 1 · 按钮被尺寸过滤误杀】bot/page_objects.py 的 _MARKET_MODAL_JS 里 visible() 要求元素宽 >80px 高 >40px，这条本来是筛弹窗容器的，却被同时用来筛按钮。『确定』按钮实际约 70x34px → 永远不满足 → 从来点不到。这就是历史上一直处理不了这两个弹窗、以及昨天起 STEP 5 全跳过的真正原因。修复：拆成 shown()（只要非 0 尺寸）与 boxShown()（容器要求 >80x40）
+- 【bug 2 · 点错已隐藏的旧按钮】每次扫描只给匹配到的按钮打 data-bot-market-confirm 标记，旧标记不清。页面里『车辆信息』的确定按钮虽然隐藏但仍在 DOM，选择器取 .first 就点到它 → 表现为反复点确定、弹窗却关不掉。修复：每轮扫描先清掉所有旧标记，选择器改 .last，JS 兜底也取最后一个
+- 【bug 3 · 配置差异项没选车款就点确定】新流程：弹窗标题含『配置差异』→ 先 _pick_config_diff_car 随便点一款车款（最多 2 次）→ 再点确定。_JS_CONFIG_DIFF 也加了宽松兜底：严格条件找不到时，按『车款（可直接选择）』表头点同级下一行，再不行点弹窗右半边第一个可点文本
+- 【新增 · 上一步遗留弹窗清理】STEP 5 开头先 _market_clear_modals（选车款 → 点确定 → 点 X，最多 3 轮）；VIN 输入/查询被遮挡时清理后重试一次，仍被遮挡则重新加载一车一件首页再试
+- 【新增 · 分两段处理弹窗】_market_handle_vehicle_dialogs：VIN 查询后先处理『车辆信息』确定，再处理可能出现的『配置差异项』；连续两轮没弹窗才提前结束，避免固定干等
+- 【新增 · X 兜底】确定按钮点不动时点弹窗右上角 X（_market_click_close_x），_ensure_market_ready 每轮也会尝试
+- 【业务兜底】STEP 5 / STEP 6 任何异常都不再让整案失败，统一降级为定损价继续提交（原来只有反爬封禁才降级，超时会直接跳过案件）
+- 【验证】自建 Element 风格 DOM 快照做真实 Playwright 测试：车辆信息→确定→配置差异项→选车款 PRO→确定→进入详情页，两步弹窗全部关闭、VIN 框不再被遮挡（PASS）；『确定』无效的死弹窗场景 4.4s 内由 X 关闭（PASS，无死循环）；mock 全链路 E2E 10 件零件 5 件改价后提交成功（PASS）；compileall 与未定义名扫描零错误
+
+## v3.9.3 · 2026-11-12 · 修复 STEP 5 必崩：claim_flow 缺 log_audit 导入导致 NameError，所有案件被跳过
+
+- 【根因】bot/flows/claim_flow.py 第 17 行只 from bot.logging_system import log_run，但文件里 7 处调用 log_audit（阈值筛选、熔断降级、STEP 7/8 异常兜底）→ 一旦命中就抛 NameError: name 'log_audit' is not defined
+- 【为什么 3.9.2 仍失败】3.9.1 的 log_audit 调用只在 skip_market / 熔断分支（平时不执行）；3.9.2 新增的『本地价阈值筛选』分支每次都会执行并调用 log_audit，于是变成了每个案件 STEP 6 必崩。真实日志 error_20261112.log 中 4 个案件（RDAA2026110000N0047883 / RDAA2026130100N0206008 / RDAA2026130600N0158550 / RDZA2026110000N0545535）全部是这条 NameError
+- 【修复】claim_flow.py 改为 from bot.logging_system import log_run, log_audit
+- 【顺手修复】gui.py _wf_add_call_step 里 STEP_REGISTRY 未导入（工作流编辑器『添加步骤节点』会 NameError）→ 补进 from bot.workflow import WorkflowNode, STEP_REGISTRY
+- 【验证】静态未定义名扫描（symtable）覆盖 claim_flow / page_objects / runners / gui / skills，零未定义名；mock 全链路 E2E 跑通（10 件零件：5 件 <¥1000 跳过比价、5 件查询、5 件自动改价、STEP 8 提交、STEP 9 报价提交成功）；skip_market=True E2E 跑通（10 件全部以定损价提交成功）；限流实测 2 次连续 VIN 查询第二次等待 5.7s，限流/熔断双关时 0.000s 直接返回
+
+## v3.9.2 · 2026-11-12 · 反爬机制全部开关化 + 修复扫描中按钮状态 / 反爬变量作用域错误导致案件被跳过
+
+- 【严重 bug 修复 · 案件被跳过】bot/page_objects.py 的 _market_rate_wait / _market_check_ban 内部给模块级变量 _market_ban_until 赋值但没有 global 声明 → Python 把它当局部变量，进入函数第一行读它就抛 UnboundLocalError。真实运行日志 data/logs/error_20261112.log 里两个报案号（RDAA2026360000N0017168 / RDAA2026440100N0018188）都是这个异常，跳过案件记录 data/skipped/跳过案件.jsonl 也是这两条。修复：两个函数补 global _market_ban_until
+- 【降级而非失败】反爬熔断不再让整个案件失败：claim_flow PART 2 捕获『反爬封禁』异常 → STEP 5 熔断则整案降级为定损价（skip_market_compare=True），STEP 6 熔断则剩余零件降级为定损价，定损单照常提交
+- 【按钮状态修复】扫描中 stop_btn 一直显示『▶ 开始扫描』蓝绿：根因是 _update_button_states 在主线程立刻执行时子线程还没把 _loop_scan_task 赋值 → 判定为未扫描。修复：新增主线程同步标志 self._scan_active，_resume_or_start_scan / _on_scan_done / _close_browser / _on_browser_failed 统一维护，_update_button_states 改读该标志
+- 【按钮配色】▶ 态从 ACCENT(青蓝) 改为 SUCCESS(绿色)，◼ 态保持 DANGER(红色)，与需求『绿色开始 / 红色停止』对齐
+- 【开关化 · 速率限流】控制台新增『⏱ 速率限流』勾选（默认开）：关掉后 VIN/零件间隔与案件间冷却全部跳过，请求全速发出
+- 【开关化 · 封禁熔断】控制台新增『🛑 封禁熔断』勾选（默认开）：关掉后不再扫『防爬/禁用/验证码』关键词，也不进入 16 分钟休眠
+- 【开关化 · 本地价阈值】沿用控制台输入框（默认 1000），只对 ≥ 阈值的零件查一车一件
+- 【开关传递】make_ctx 新增 market_rate_limit / market_breaker；run_loop_scan / run_loop / _loop_body / run_single 全链路透传；GUI 三个调用点（挂机扫描 / 单步 / 老入口）都传
+- 验证：compileall 零错误；反爬工具函数冒烟测试通过（限流关+熔断开、两者都关都不抛异常）；runner 签名检查含 market_rate_limit / market_breaker
+
+## v3.9.1 · 2026-11-11 · 双按钮状态机：开始挂机先拉起浏览器等你登录，再点『开始扫描』才正式启动业务
+
+- 【用户痛点】原来点『开始挂机』就立刻开始扫描业务，两个门户都还没登录 → 全是报错。现在：开始挂机 = 拉浏览器等登录；开始扫描 = 正式跑业务；停止扫描 = 暂停业务但不关浏览器；停止挂机 = 真正关浏览器
+- 【架构】bot/envs/__init__.py Environment 加 start()/stop() 手动生命周期（async with 保留兼容），加 started/stopped 幂等标志
+- 【runner 三层拆】bot/runners/loop.py：原 run_loop（一次性 async with env）拆成 open_loop_browser / run_loop_scan / close_loop_browser 三个公开 API + 一个 _loop_body 私有循环体；run_loop 老入口保留（内部组合三层 API）
+- 【暂停机制】run_loop_scan 新增 pause_event: asyncio.Event 参数：set→循环空转 sleep；clear→立刻继续；request_stop() 优先级最高（暂停中也会 break）；_wait_poll 也感知 pause_event（轮询等待期间 set 了就放慢频率）
+- 【GUI 状态机】gui.py：on_start（▶ 开始挂机 / ◼ 停止挂机 双态）、on_scan_button（▶ 开始扫描 / ◼ 停止扫描 双态）、_update_button_states 统一刷新两按钮的文案和 state；持久 asyncio loop 线程（run_forever）保证 pause_event 跨 scan 调用能恢复
+- 【安全】停止扫描绝不调 request_stop —— 只 set pause_event，env 保持 started=True，下次点『开始扫描』clear pause_event 立刻继续；停止挂机才 request_stop + close_loop_browser
+- 验证：三层 API open→scan(3)→close 跑通（3 件 10/10 合规全过）；暂停/恢复/停止串测跑通：env.page alive after scan exit=True（关浏览器前浏览器确实一直活着）；单步回归 1 件全过；compileall 零错误
+
+## v3.8.9 · 2026-11-11 · 首页报案号带标签气泡（省内/省间/集/超60天等）也能自动点开
+
+- 【根因 1 · 文本匹配】生产页面 DOM 里，标签气泡是 claim-no span 的子元素 → textContent 变成『RDAA...18420 省内』，旧代码要求严格等于 → cursor:pointer 的 claim-no span 被漏掉，只剩弱候选 DIV/TD。日志证据：`_JS_FIND_CLAIM_EXACT` 对带『省内』的 RDAA2026152500N0018420 只找到 score=31 的 DIV 和 score=-12 的 TD，<40 标记成 lowScore
+- 【根因 2 · 视觉叠层】即使找到了 claim-no span，Playwright 浏览器级 `.click()` 落到了 z-index 更高的标签气泡上 → Vue @click 没触发
+- 【代码改点 1】_JS_FIND_CLAIM_EXACT：文本匹配改成 3 档 —— ① 严格等于 ② 以 claim 开头且尾部仅 ≤2 个短标签（长度≤6、不含4位以上数字）③ contains 模式；额外 +20 给 class 含 claim-no/claimNo 的元素；score 下限从 40 降到 30；新日志字段 matchMode=exact/prefix-tags/contains
+- 【代码改点 2】_JS_SCAN_CLAIM_ROWS：找 clickable 元素也加三档 —— 优先 querySelector('[class*="claim-no"]')，其次严格等于，再其次前缀+短标签
+- 【代码改点 3 · 点击兜底】新增 _JS_SYNTH_CLICK + _dispatch_claim_click + _wait_quote_opens：合成 mouseover→mousedown→mouseup→click 完整事件序列，绕过视觉叠层直接发给 claim-no span 的 Vue @click 处理器；step_home_click_claim 新增 ③.6 兜底（所有浏览器级点击策略都失败后才用）
+- 【策略位置】JS合成点击是最后兜底（在 ①精确点击、②重试、③行内其他入口、③.5强点击之后），正常情况不会被触发；只在视觉叠层/浏览器级点击被挡时才介入
+- 验证：mock 全链路正常（9/9 改价成功、STEP 9 报价完成 → 提交）；生产日志 `run_20261111.log` 中 4 个带标记的案件（18420 省内、197029 省间、18420 集+超60天、0289236 超60天+集）本轮文本匹配应该能直接命中 score=65 的 SPAN；compileall 零错误
+
+## v3.8.8 · 2026-11-11 · 改价改『报价』列不是本地价 + 公式分母从 guidePrice 改成本地价
+
+- 【业务规则澄清】定损平台表格里本地价列是**只读的**，程序之前尝试往本地价列填值 → 没 input 元素 → 4s 超时失败 → 改价 0/1 零件。真正可编辑的是「报价」列（对应 data-lossobj.estiPartPrice / evalPartPrice 字段）
+- 【公式修正】新公式：报价 = 一车一件市场价 × (定损价 / 本地价)，保留整数 round(..., 0)
+- 【公式分子】优先 data-lossobj.guidePrice（真正的定损基准价，mock 兜底 evalPartPrice）；公式分母 = data-lossobj.estiLocalPrice（本地价，不可修改，仅用作分母）
+- 【代码改点 1】bot/models.py PartItem.suggested_fixed_price：分母 self.guide_price → self.local_price，注释同步改；PartItem 字段注释标注 local_price=不可修改、fixed_price=报价列值
+- 【代码改点 2】bot/page_objects.py data-lossobj 字段映射：list_price 优先 guidePrice（之前错误映射到 evalPartPrice，它实际等于 local_price），guide_price 保持兼容
+- 【代码改点 3】bot/page_objects.py _loss_fix_local_price → _loss_fix_quote_price：JS 从找『本地价』列改成找『报价|定价|定损报价|核报价|审定价』列（正则），找不到时兜底本地价列；函数名、日志、setLocalPrice → setQuotePrice 一并改名
+- 【代码改点 4】step_loss_fix_over_market 装饰器 desc/docstring/打印提示全部改成『报价列』，安全兜底放宽到 +5% 容忍后压到市场价 98%，改价日志带上公式表达式
+- 【mock 同步】loss_assessment.html 换件表加「报价(元)」列 input（默认值 = 本地价）、setLocalPrice → setQuotePrice、暂存校验从『本地价 vs 市场价』改成『报价 vs 市场价』、getOverMarketIndexes 同理；超市场价判定从 localPrice 改 quotePrice
+- 验证：mock 全链路 9 个超市场价零件报价列改价成功（step_loss_fix_over_market → _loss_fix_quote_price → setQuotePrice 9/9），STEP 8 重比对全部合规，STEP 9 报价完成 → 提交任务；生产 run_20261111.log 09:16 本地价填不上的问题本次消除；compileall 零错误
+
+## v3.8.7 · 2026-11-10 · 新增『工作日志』：业务处理明细表 + 按日统计汇总表（GUI 页面 + Excel 三 Sheet）
+
+- 【定位】只记录业务处理明细（给用户看的工作日志），与程序运行日志（logs/run_*.log）完全分开，互不影响
+- 【明细表】每笔报案号一行：处理时间、报案号、车牌号、VIN、零件数、合规数、超市场价数、是否修改报价、修改零件数、处理结果（全流程完成/跳过/需人工/失败）、跳过步骤（如 STEP 6）、备注（具体卡点原因）
+- 【统计表】按日期汇总：处理总数、全流程完成、跳过(卡在某步)、需人工、修改报价案件、修改零件数、零件总数、超市场价零件数，并附『合计』行；每次写入后自动按明细重算，永远与明细一致
+- 【Excel】data/ledger/工作记录_YYYYMM.xlsx 三个 Sheet：理赔报价记录 / 统计汇总 / 零件明细（按月自动分文件）
+- 【旧文件兼容】旧的 10 列表头会自动迁移成新 12 列并保留全部历史行；旧文件缺『统计汇总』Sheet 时，GUI 读取会用内存聚合补算，统计表不会空白
+- 【GUI】侧边栏新增『📒 工作记录』页：上半部分处理明细（最新在最上，按完成/跳过/需人工着色），下半部分统计汇总（合计行高亮），带『刷新 / 打开 Excel / 打开目录』按钮
+- 【接入】循环挂机的完成、直供价跳过、异常跳过三个分支全部写入工作日志；单次运行同样写入（演练模式不写）
+- 【不改业务】所有改动只在记录层与页面层，原有业务流程逻辑未做任何调整
+- 验证：旧 6 行 10 列文件迁移 → 8 行 12 列、统计 5 日 + 合计正确；缺统计 Sheet 旧文件读取自动补算；GUI 工作记录页明细 8 行 / 统计 6 行渲染正常；compileall 零错误
+
+## v3.8.6 · 2026-11-09 · 新增防休眠：挂机时系统不再自动熄屏/屏保/锁屏
+
+- 【新功能】新增 bot/power.py：调用 Windows SetThreadExecutionState(ES_CONTINUOUS|ES_SYSTEM_REQUIRED|ES_DISPLAY_REQUIRED)，运行期间阻止系统睡眠、显示器关闭与屏保启动，从而避免锁屏打断自动化
+- 【接入 GUI】gui.py 启动 mainloop 前 keep_awake()，窗口关闭时 finally allow_sleep() 恢复正常电源策略
+- 【接入命令行】bot/main.py 在单次/循环/人工三种模式运行前后 keep_awake() / allow_sleep()（含异常退出）
+- 【限制】该 API 无法绕过组策略强制锁屏，也无法阻止手动 Win+L；非 Windows 平台自动跳过并打印提示
+- 验证：keep_awake() 返回 True、allow_sleep() 恢复正常；compileall 零错误
+
+## v3.8.5 · 2026-11-09 · 修复第三个报案号反复扫到却点不开（STEP 2 始终停在门户首页）
+
+- 【现象】run_20261109.log 09:04-09:06 同一报案号 RDAA2026110000N0517840 反复被扫描到，STEP 1 日志『[✓] 点击: 报案号』『[✓] 点击: 一级报价单元格』全部报成功，但页面 URL 一直是 claimoperate/，STEP 2 报『当前不在报价处理页，找不到 #editButtons』→ 跳过；可点击行 N0496869 正常
+- 【根因 1】该行的候选元素里出现 TD(is-hidden) —— Element UI 固定列会额外渲染一份 is-hidden 的重复单元格，点它没有任何反应；而真正可点的『一级报价』span 在另一份 DOM 里
+- 【根因 2】列表提取走了『页面文本正则兜底』（未匹配到表格结构），会把非待处理区的纯文本报案号也收进来，于是程序对着不可点击的行反复尝试
+- 【修复 1】JS 精确扫描评分：祖先链含 is-hidden / el-table__fixed-hidden 的元素 -60 分，直接沉底不被选中
+- 【修复 2】Playwright 行内精确文本策略：显式跳过 is-hidden 祖先下的候选（原来只判断 is_visible）
+- 【修复 3】新增 _JS_SCAN_CLAIM_ROWS + _scan_claim_rows：只在 tbody tr / .el-table__row / li 里找报案号，并按 cursor:pointer / a[href] / onclick 判断该行是否可点击；可点击行排前面，不可点击行排后面并打印样本，不再让纯文本节点污染列表
+- 【修复 4】新增 _try_force_row_click：对点不开的行做强点击兜底 —— 报案号单元格 / 流程图『一级报价』『报价』文字 / 行内链接 / 整行，各自先双击再『点击+回车』（部分门户是双击打开），每目标等 4s
+- 【修复 5】全部失败时 _dump_claim_row_html 把该行的可点击元素清单 + outerHTML(1500字) 打进日志，下次可直接按真实 DOM 精修
+- 验证：mock 全链路 STEP 1 → STEP 9 正常（『JS精确扫描 → SPAN(claim-no,cur=pointer…score=68)』）；合成门户 DOM 用例：含 is-hidden 副本的行仍能正确定位到可点击 span，纯文本行被标记不可点击；强点击双击成功触发页面跳转
+
+## v3.8.4 · 2026-11-06 · 新增『直供价』判断：只要有一个零件直供价有值，整案跳过
+
+- 【新规则】定损平台收集零件价格时，若『直供价』列任意零件有数值（>0）→ 不做比价，直接跳过该报案号，处理下一个
+- 【实现 1 / JSON 通道】data-lossobj 里按关键词（directSupplyPrice / supplyPrice / directPrice / supplyAmount / zgPrice…）匹配直供价字段，值 >0 即命中；同时在 STEP 4 打印 data-lossobj 全部字段名，便于后续核对真实字段
+- 【实现 2 / 表头通道】新增 _JS_SCAN_DIRECT_SUPPLY_COL：按表头文字『直供』定位列，逐行取单元格数值，任一 >0 即命中（不依赖字段命名，JSON 通道没命中时自动兜底）
+- 【实现 3 / 兜底方案 B】表头列映射新增 direct_supply（『直供』关键字），逐行判定
+- 【拦截】STEP 4 结束设置 context['skip_direct_supply'] → claim_flow 直接 return 'skip_direct_supply'（STEP 5-9 标记 skipped）；loop.py 记录台账 status=skipped、note='直供价有值 → 跳过该报案'，并继续下一个报案号
+- 验证：mock 全链路不受影响（无直供价列，正常跑完 STEP 9）；合成页面『直供价 320.00』用例命中返回 True；字段匹配单测 directSupplyPrice=320 → 320.0、supplyPrice=0 → 0.0
+
+## v3.8.3 · 2026-11-06 · 修复 STEP 7 崩溃导致整案被跳过（setLocalPrice is not defined）
+
+- 【根因】step_loss_fix_over_market 直接 page.evaluate('setLocalPrice(idx, price)')，而 setLocalPrice 只存在于 mock 页面；生产没有该函数 → ReferenceError: setLocalPrice is not defined → STEP 7 抛异常 → 整案被判『卡在 STEP 7』跳过，STEP 8/9 完全没跑（error_20261105.log 17:00:27）
+- 【修复 1】改价前用 typeof setLocalPrice === 'function' 做能力探测，生产不再报错
+- 【修复 2】新增生产改价通道：按 data-lossobj 的 factPartCode/serialNo 定位换件行 → 用表头找『本地价』列 → 单元格内 input 直接填值并派发 input/change + Tab 失焦；没有 input 时双击唤起内联编辑再试一次；全程回读校验
+- 【修复 3】STEP 7 单零件 try/except，改价失败只记录（fixed_price 置空＝以定损价为准），本步骤永不抛异常
+- 【修复 4】改价失败 → context['resync_loss']=True → STEP 8 开头自动重新执行『同步定损』（含全选复选框 + 确认弹窗处理），然后照常 提交 → 提交定损单 → 报价业务动作 → 提交 → 提交任务，把后续流程完整走完
+- 【修复 5】claim_flow 里 STEP 7 / STEP 8 都加了兜底 try/except：任何异常只记日志与台账，不再让案件被跳过
+- 【修复 6】暂存按钮支持生产 #submitBaseInfo / 文字『暂存』，点完顺带确认提示框
+- 验证：mock 上 setLocalPrice 通道返回 fixed=True 且单元格变 ¥88；用合成生产 DOM（tr[data-lossobj] + 本地价 input）验证改价通道回读 ¥650 成功；mock 全链路 STEP 8/9 正常完成
+
+## v3.8.2 · 2026-11-05 · 修复零件查询点击了『重新查询』导致退回 VIN 首页 / 全部零件查不到价
+
+- 【根因（关键）】config.py 里 part_search 配的是 button.btn-research.ev_btn —— 这是一车一件详情页的『重新查询』按钮，点它就跳回 VIN 首页！所以每查一个零件其实都把页面退回输入 VIN 的界面：既没有执行零件查询（第几个零件都是 price=None），又把搜索框弄没了（下一个零件 15s 等不到 → 案件被跳过）
+- 【修复 1】part_search 改为 button.btn-search（源码 一车一件.html 核实：搜索框右侧 class=btn-search 的『查询』按钮）；Escape 也已从 _close_market_result 中全部移除（该 SPA 把 Esc 当返回，同样会退回 VIN 首页）
+- 【修复 2】市场价取值改按真实结果区结构：section.part-list → main ul li → .cell.price-oe .price（.part-details 里 el-table 的装配图子件价格不参与，避免取错价）
+- 【修复 3】新增 _recover_market_page：如果页面被退回 VIN 首页，用 context['vin'] 重新填 VIN → 点查询 → 处理车辆信息/配置差异项 → 回到零件查询界面，然后继续查后面的零件
+- 【修复 4】STEP 6 单零件 try/except：某个零件查询异常只跳过该零件（市场价置空＝以定损价为准），不再让整个案件中止；若页面彻底无法恢复才 break，后续继续 STEP 7 提交，不会“直接跳过案件”
+- 【配置】result_tbody / market_price_cell 同步为真实结构 .part-list main ul / .cell.price-oe .price
+- compileall 零错误；mock 全链路回归通过（10 个零件读价、比对、STEP 7 修复、STEP 9 提交全部正常）
+
+## v3.8.1 · 2026-11-05 · 修复零件查价后查询输入框消失导致 STEP 6 卡死 + 市场价取不到（结果面板不是标准 table）
+
+- 【澄清】run_20261105 10:40 的日志证明 VIN 已经成功填入并查询：audit『输入: VIN码输入框 → LFVVB9G37P5215417』+『点击: 查询 VIN 按钮』+『VIN 查询成功，已进入详情页』；用户看到的空白 VIN 首页是流程跳过该案后 go_home 的画面（历史下拉里第一条正好是这个 VIN）
+- 【真因 1】零件 1 查询后结果面板遮挡/切走了查询界面：STEP 6 在查询后调用 dismiss_market_modal 点『确定』——结果面板上的『确定』是“选中零件并跳转”，点完页面就离开零件查询视图 → 第二个零件的输入框 15s 等不到 → 整个案件被跳过
+- 【真因 2】市场价仍取不到：结果面板不是标准 <table>+<thead>，策略 A（thead 表头定位）扫不到列 → price=None
+- 【修复 1 新增 _close_market_result】读完价格后按 Esc → 关闭图标(.el-dialog__headerbtn/.el-dialog__close/…) → 切回『常用配件查询』标签 → 取消/关闭 按钮 的顺序退回查询界面；绝不点『确定』
+- 【修复 2 新增 _JS_MARKET_PRICE_GEOMETRY】按『4S店价格』表头节点的屏幕坐标往下取同列（左边对齐 ±24px、表头下方）的数字，作为策略 B 兜底；仍取第一个 > 0 的值
+- 【修复 3 dismiss_market_modal 增加 text_filter】只点弹窗文本含『车辆信息/配置差异/提示/警告』的『确定』，避免误点结果面板；STEP 5、_ensure_market_ready、STEP 6 每轮前置清理全部改为带过滤调用
+- 【STEP 6 顺序调整】点查询 → 读价 → _close_market_result → 再判断是否跳过，保证『查不到价』分支也会退回查询界面
+- compileall 零错误；mock 全链路回归通过（10 个零件全部读出市场价，比对 1 合规 / 9 超市场价）
+
+## v3.8.0 · 2026-11-05 · 修复已查到价却报『查不到市场价』+ 自动处理『配置差异项』弹窗
+
+- 【市场价根因】旧选择器 td.market-price / td:last-child / td:has-text('¥') 在生产完全对不上：结果表最后一列是『现用OE号』，单元格文本是『属于本车的OE号 A20481109…』→ _parse_price 解析失败返回 None → 明明查到了 1604.05 却报『查不到市场价』
+- 【市场价修复】新增 _JS_MARKET_RESULT_PRICE：整页扫描 table，用 thead 表头定位『4S店价格』列的列号，一次性取回所有结果行该列的单元格文本；新增 _parse_market_price_cell：单元格里常见『1604.05 / 0.00』两个数字，取第一个大于 0 的；优先返回 rowText 含『属于本车 / 精准』的那一行，否则第一行
+- 【防卡死】市场价提取同样改为一次性 JS 读取 + 8s 轮询，不做逐格 Playwright 等待
+- 【配置差异项】部分车型点完『车辆信息-确定』后会再弹『配置差异项』（左侧配置项、右侧『车款（可直接选择）』列表）；不处理就永远进不到零件查询界面（run_20261105 第二个案件的 STEP 6 就是卡在等输入框）
+- 【新增 _JS_CONFIG_DIFF + _pick_config_diff_car】定位可见且 innerText 含『配置差异项』的弹窗，在弹窗右半边挑一个可见、文本 4~90 字、cursor:pointer 的条目（自动排除『确定/下一步/车款（可直接选择）/选择配置差异项』），点它任选一款车款
+- 【新增 _ensure_market_ready】20s 内轮询：『配件查询』输入框可见即通过；期间循环处理 配置差异项 选车款 + 车辆信息/配件信息『确定』；STEP 5 用它替代原来的裸 wait_for，STEP 6 每轮开始也多兜一次
+- compileall 零错误；mock 全链路回归通过（10 个零件价格全部正常读出）；_parse_market_price_cell 单测：'1604.05 0.00' / '0.00 1604.05' / '1,604.05' 均得到 1604.05
+
+## v3.7.9 · 2026-11-05 · 修复报价任务提交对话框点不到（生产是 el-dialog，不是 mock 的 #quote-submit-modal）
+
+- 【根因】生产提交对话框 DOM：div[role=dialog][aria-label='报价任务提交'].el-dialog（宽 880px），按钮为 button.el-button.el-button--primary.is-round > span『提交任务』；旧代码找的 #quote-submit-modal（等 class 含 show）和 #confirm-quote-submit 只存在于 mock，生产永远命中 0 → 对话框开着没人点，流程卡死
+- 【日志证据】run_20261105.log 09:40:21 点了报价处理『提交』→ 09:40:26『提交对话框未弹出（可能人工已确认）』→ 09:40:29『未找到「提交任务按钮」』→ 09:40:45『未检测到明确成功提示』，对话框实际一直开着
+- 【新增 _quote_wait_submit_dialog】按 4 个候选选择器轮询可见性：[role=dialog][aria-label*='报价任务提交'] → .el-dialog[aria-label*=...] → .el-dialog:has-text('报价任务提交') → #quote-submit-modal（mock），默认等 15s，命中返回 locator
+- 【新增 _quote_click_submit_task】在对话框内依次找 button:has-text('提交任务') → .el-button:has-text('提交任务') → #confirm-quote-submit，全部不可用时兜底点页面里最后一个可见的『提交任务』按钮
+- 【STEP 9 重写】入口先用 1s 探测对话框是否已被人工打开（打开则跳过选业务动作和点提交）→ 否则选业务动作『报价完成』→ 点提交 → 等 15s 对话框出现 → 点『提交任务』→ 等对话框关闭（8s）→ _wait_page_result 校验成功提示
+- compileall 零错误；mock 全链路回归通过：对话框已弹出 → 点击『提交任务』→ 对话框已关闭 → 流程完成
+
+## v3.7.8 · 2026-11-03 · 修复报价页业务动作未选中 → 提交静默失败（生产是 el-select 不是 radio）
+
+- 【根因】生产报价页的「业务动作」是 Element UI el-select 下拉框（选项：报价完成/退回/提交上级），不是 radio；原代码 `input[name='biz-action'][value='quote-done']` 在生产 count()==0，整个 if 块被跳过 → 业务动作从没被选中过就直接去点提交按钮 → 表单校验静默失败
+- 【日志证据】run_20261103.log 14:58:15~14:59:10：STEP 9 里完全没有『报价意见 → 报价完成』的日志，直接跳到『报价处理 → 提交按钮』并误判『未检测到明确成功提示，按已提交处理』
+- 【配置】config.py 新增 quote_biz_action_trigger / quote_biz_dropdown_item / quote_biz_done_text(=报价完成) / quote_biz_superior_text(=提交上级)，删除旧的 quote_biz_action_done / quote_biz_action_superior
+- 【新函数 _quote_pick_biz_action(page, label_text)】优先按 label 文本找 radio label（mock 兼容）→ 次选点 el-select 触发器打开下拉 → 等 dropdown:visible 出现 → 点 .el-select-dropdown__item:has-text(label_text) → 最终兜底遍历所有 item 比 text；加 safe_click + human_delay
+- 【STEP 9 step_quote_finalize 重写】选业务动作 / 滚到底部点提交 / 等待提交对话框弹出（#quote-submit-modal class 含 show）→ 点确认按钮 → _wait_page_result 校验成功提示
+- 【补救分支 step_quote_submit_superior 同步】业务动作从旧 radio 选择器也改为 _quote_pick_biz_action(page, '提交上级')
+- compileall 零错误；mock 非 dry-run 全链路通过：业务动作(radio) → 报价完成 → 提交按钮 → quote-submit-modal 弹出 → 提交任务按钮 → 成功提示
+
+## v3.7.7 · 2026-11-02 · 修复定损平台换件表读表头后卡死 + 一车一件确认框自动点『确定』
+
+- 【卡死根因】方案 B 逐行逐格用 Playwright 读取：rows.nth(i).locator('td') 里对 .part-code 调 get_attribute('data-code')，元素不存在时每个等待 30s，10 行约 5 分钟 → 表现就是「读完表头就卡住不动」
+- 【卡死修复】方案 B 改为一次性 JS 读回整表：新增 _JS_READ_PARTS_TABLE，在同一帧里取 thead 表头 + 所有 tr 的所有 td 文本（同时剔除 tooltip/popover/tips 等提示类后代节点，避免生产 tooltip 文本污染零件名称），Python 侧只做正则清洗，零 Playwright 逐格等待
+- 【弹窗】一车一件查 VIN 后会弹「车辆信息」确认框（品牌/车系/年份 + 橙色『确定』），不点掉页面就停在弹窗上，后续查询全部无法进行；新增 dismiss_market_modal：遍历所有 frame 找可见弹窗（el-dialog / el-message-box / modal / role=dialog / layui-layer 等），点其中文字为 确定/确认/知道了/关闭 的按钮，最多连点 3 层
+- STEP 5 查 VIN 后先等弹窗 12s 并点掉，进详情页后再补点一次；真实环境额外校验「配件查询输入框」是否出现，没出现即判定 VIN 查不到 → skip_market_compare（沿用上一版跳过整个比价环节的逻辑）
+- STEP 6 每个零件查询前先清残留弹窗（不等待，命中才点），查询后等 2s 并点掉「配件信息」类确认框，再读市场价
+- 清理 VIN 候选里的非法伪类选择器 .info-cell:has-label('定损VIN')/('VIN')（Playwright 报 'is not a valid selector' 并打印大段堆栈淹没日志）
+- compileall 零错误；mock 全流程回归通过：表头 9 列、数据行 10 条、列映射 {'idx':1,'code':2,'name':3,'qty':4,'price_type':5,'local_price':6,'list_price':7}，零件名称/编码干净无 tooltip 污染
+
+## v3.7.6 · 2026-11-02 · 修复公式改为定损价/指导价×市场价 + VIN/零件容错
+
+- 【修复公式】PartItem 新增 guide_price 字段（从定损平台 data-lossobj.guidePrice 填充），suggested_fixed_price 公式改为：定损价(evalPartPrice) / guidePrice × 市场价(market_price)，结果保留整数 round(..., 0)
+- 【STEP 5 VIN 容错】一车一件 VIN 查不到（详情页等待超时）不再抛异常，而是设 context['skip_market_compare']=True 正常返回，整个比价环节被跳过，所有零件以定损价为准
+- 【STEP 6 零件容错】逐个零件查询到 price=None 或 price<=0 时，跳过当前零件继续下一个（market_price=None → within_market=None → 不参与比价/修复），以定损价为准
+- 【claim_flow PART 2 入口守卫】STEP 5 完成后检查 skip_market_compare flag，命中则跳过 STEP 6；同时 market_queries_count 改为只统计实际查到市场价的零件数
+- 方案 A（data-lossobj JSON）直接填充 guide_price/list_price 字段；方案 B（mock 兜底）guide_price=None → suggested_fixed_price 返回 None，mock 环境自动跳过修复环节，生产走方案 A 有完整数据
+- compileall 零错误；mock dry-run 全流程通过（STEP 5 VIN 查询成功、STEP 6 10 零件市场价查到、PART 3 进入自动修复逻辑）
+
+## v3.7.5 · 2026-11-02 · 生产实测零件解析修复：data-lossobj JSON 方案 + 表头列映射兜底
+
+- 生产定损平台 bootstrap-table td 里混了 tooltip 提示文本（如'配件【后转向节（右）】可以重复使用...'），text_content() 取出来不是干净值，导致零件字段错位/丢失
+- 新增方案 A（首选）：从每个 <tr data-lossobj='{...}'> 属性提取完整 JSON（含 factPartCode/partName/evalPartAmount/estiLocalPrice/evalPartPrice/guidePrice 等全部字段），HTML decode + JSON.parse，生产实测 19 行一次命中
+- 新增方案 B（兜底，mock 环境用）：按表头列名动态建 col_map（序号/编码/名称/数量/本地价/定价）+ td 正则清洗 re.search(r'(\d+)', ...)
+- 两种方案 PartItem 统一映射：code=factPartCode, name=partName, local_price=estiLocalPrice, list_price=evalPartPrice, 同时把 piccPartCode 塞 context 备查
+- data-lossobj JSON 关键字段（已从实际运行数据解码验证）：factPartCode=E00130010, partName=后转向节（右）, serialNo=1, evalPartAmount=1, estiLocalPrice=690, evalPartPrice=690, guidePrice=693, piccPartCode=30301183
+
+## v3.7.4 · 2026-11-02 · 生产环境三项对齐：换件表、同步按钮、提交弹窗 + JS扫描器硬性规则加固
+
+- 运行日志（11:07-11:10）复盘：生产环境三个新问题 —— ①JS扫描器选到DIV.cell(score=31,cur=auto)而不是报案号span；②换件表被跳过（实际有零件）；③STEP 8提交后弹窗等待超时报错
+- 【问题1 JS扫描器加固】生产环境报案号span的cursor可能不是严格pointer → JS扫描器加硬性规则：cursor:pointer的候选强制排最前（不管分数多少），业务号DIV.cell（cur=auto,score=31）被强制排后；选到的最高分<40则标记lowScore，Python侧跳过并打日志走后续策略；同时把所有候选（tag/cursor/score/inTable/inQueryPanel）全打印出来便于生产debug
+- 【问题2 换件表跳过】config.py的parts_tbody/sync_loss_btn/select_all_parts/diagnosis_modal/submit_loss_order全从mock id改成多候选组合：生产定损平台用bootstrap-table（#partListTable tbody / .bootstrap-table .table tbody），同步按钮id=#tbdsBtn（从HTML里确认），全选框#btSelectAllD-0；_count_loss_parts改成循环尝试5个选择器，排除bootstrap-table的'没有数据...'占位行；step_loss_sync的同步按钮候选加#tbdsBtn优先
+- 【问题3 提交弹窗等待超时】旧代码await expect(diag).to_have_attribute('class', re.compile(r'show'))但生产弹窗（el-message-box/modal）class里没有show；改成多候选弹窗轮询（#diagnosis-modal/.el-message-box/.el-dialog/.modal.in/.modal.show/[role=dialog]），每0.5s试一次共12s，找到任何可见弹窗就算开；提交定损单按钮也改成多候选（#submit-loss-order/button:has-text('提交定损单')/button:has-text('提交定损')/.el-message-box button:has-text('确定')）
+- compileall零warning；mock全流程回归：STEP 3换件表命中#evalPartDiv table tbody→10行 ✅；STEP 4同 ✅；JS扫描器选到SPAN(claim-no,cur=pointer,score=68) ✅；10零件全流程通过
+
+## v3.7.3 · 2026-11-02 · 只有 1 行时『点到业务号列』的根因修复：加 JS 精确扫描 + 评分排序
+
+- 用户实测：列表只剩 1 个报案号时，程序点到了『业务号列』的纯文本（和报案号内容完全相同但无 cursor），所以没反应；多个报案号时不会错（因为 tr:has-text scope 正确）
+- 根因：Vue 动态渲染 + get_by_text(exact=True) 在页面全局范围内，会同时命中正确的报案号列（蓝色 span + cursor:pointer）和错误的业务号列（纯文本 span，内容恰好等于报案号）；旧版依赖 tr:has-text scope，但只有 1 行时 scope 可能因为 Vue 用 div 布局而失效，掉到全局扫描就会错选
+- 新增 JS 精确扫描（_JS_FIND_CLAIM_EXACT）：全页 span/div/a/td 里按 textContent 精确匹配报案号，然后按评分排序——cursor:pointer +25、蓝色 +20、在表格里 +15、查询面板里 -40、窄元素(可能是 input 提示) -15；业务号列（纯文本、无 cursor）大幅扣分被自动排除
+- JS 扫描器同时过滤查询面板（祖先 class 含 search/query/form/filter/input/panel/toolbar/header 一律 -40 分），避免默认值/占位符里恰好显示报案号时被误命中
+- find_claim_link 重排优先级：⓪ JS 精确扫描（首选）→ ① 行内精确文本 → ② 页面可见文本 → ③ 行内元素 → ④ 整行 tr → ⑤ 单元格 td；JS 扫描命中时会打印详细元素信息（tagName/className/cursor/width/score/是否 inTable/是否 inQueryPanel）
+- 编译无 warning（JS 字符串用 Python raw string 避免 /regex\(... 里的反斜杠被解释为 Python escape）
+- 端到端测试：单一行 + 业务号列精确等于报案号 + 查询面板默认值也等于报案号 —— JS 扫描器正确命中 SPAN(claim-no-ok, cur=pointer, score=68)，业务号列 SPAN(biz-no-plain, cur=default, score=-25) 和查询面板（inQueryPanel, score=-15）都被排除
+- mock 全流程回归通过（RDZA2026110000501913，10 零件，VIN 提取正常，STEP 1 明确走 JS精确扫描）
+
+## v3.7.2 · 2026-11-02 · 修复：报案号点不动时误开『留言页面』导致案件被跳过、且整轮不再重试
+
+- 运行日志（10:06）+ 生产 DOM 复盘：点报案号 2 次都没反应后，兜底层点了『操作』列的图标，打开的是 http://10.164.128.92/claimcar/32160/message/index?registNo=...（留言页面），随后 STEP 2 的 URL 守门拒绝执行 → 该案件被判跳过并加入 processed_set，之后每轮都提示『都处理过了』，永远不再处理
+- 点击结果改为严格校验：只有 URL 命中 quote/index 或 quote_process 才算打开发报价页；点错入口打开的新标签（如 message/index 留言页面）会被记录并自动关闭，绝不交给 STEP 2
+- 『一级报价』入口修正：生产实测它是 <span style="cursor:pointer">，不是 <a>，旧版 a:has-text('一级报价') / [class*='flow'] 都命中不了；现在按文字定位（span/div/td 全覆盖），并保留整格点击兜底
+- 『操作』列图标不再作为兜底入口（实测点开的是留言页，属于错误入口），避免白等 6~8 秒还开错页
+- find_claim_link 增加定位来源日志（行内精确文本 / 页面可见文本 / 行内元素 / 整行 / 单元格 / 纯文字），并优先选择 cursor:pointer 的那个元素（生产报案号就是 cursor:pointer 的 span）
+- 行容器定位 JS 修正：报案号 span 里嵌了空标记 <span class='zi lflagtext'></span>，旧判断要求 children.length===0 → 定位失效；改为按文字相等取最深元素，并做 tr / 祖先 / JS 标记三级兜底
+- 循环挂机新增『打不开报价页』重试：卡在 STEP 1/STEP 2 时不再立刻拉黑该案件，下一轮继续重试，最多 3 轮；只有 3 次都失败才跳过并写台账（避免临时性问题让案件整个班次都处理不了）
+- STEP 1 全部尝试失败时会打印当前可见弹层（如门户提示『案件已被占用』），便于判断是入口问题还是业务限制
+- 验证：按生产真实 DOM（el-table 行 + 报案号 span + 一级报价 span + 操作图标）搭页面做端到端用例 —— 报案号点不动时能通过『一级报价』打开报价页（页面含 #editButtons）；报案号正常的行仍是一次点击直达；mock 两个案件回归通过
+
+## v3.7.1 · 2026-11-02 · 生产实测两项修复：定损 VIN 提取不到 + 列表最后一个报案号点不动
+
+- 【VIN 提取失败】定损平台实测 VIN 元素没有任何 vin 相关 id/class，结构是 `定损VIN：` 标签后跟一个同级 span，值被 `<script type="jsv#90~"></script>` 这类 JSV 文本标记包住（文本里还带引号）→ 旧版按选择器永远找不到
+- STEP 4 新增 JS 兜底 _JS_FIND_VIN：① data-label 含 vin/车架 的元素 → ② 含「定损VIN/车架号」的最短元素，按 自身 → 下一个兄弟 → 父级 → 祖父级 逐层取 → ③ 全页扫描；去引号/空格/中文后只认 17 位 [A-HJ-NPR-Z0-9]，排除 17 位纯数字与 RD 开头（避免把 21 位报案号 RDAA2026110000N0527486 的子串误当 VIN）
+- VIN 候选选择器同步补充 [data-label*='vin' i]、[data-label*='车架'] 与 xpath 兄弟/父级定位；命中文本统一走 _clean_vin 校验（mock #loss-vin 路径不变）
+- STEP 4 报案号读取加固：生产没有 #tb-claim → 回退上下文 claim_no → 再回退页面文本里的报案号；三者都没有才报错
+- 【最后一个报案号点不动】根因：旧 find_claim_link 用 get_by_text(...).first，可能命中查询条件区/隐藏模板里的同名文本 → 点击无任何反应；生产截图还看到左侧被浮出的『请选择』面板挡住
+- find_claim_link 重写：行内精确文本优先 + 逐个 is_visible() 过滤（跳过查询区/隐藏元素）+ 行内可点击元素 + 整行 + 单元格 五级兜底
+- STEP 1 点击改为『3 次尝试』：① 点报案号 → ② 按 Esc 收起浮层后重新定位再点（被遮挡时自动改用 JS dispatch click 派发）→ ③ 点同一行其它入口（流程图『一级报价』/操作图标，title 含编辑的一律跳过）；每次点击后同时等新标签页与同页 SPA 路由
+- 新增 _claim_row_scope（tr → 祖先元素 → JS 标记 data-bot-row 三级定位行容器），保证兜底入口不会点到别的案件那一行
+- 验证：mock 两个案件（RDZA2026110000501913 / RDZA2026110000541763）全流程通过；VIN 解析用生产结构（JSV script 标记 + 引号包裹）离线验证得到 LFV3A24K5L3143247，报案号不会被误判为 VIN
+
+## v3.7.0 · 2026-10-30 · 企业微信新消息自动扫描（截图 + Windows 自带 OCR，无需管理员/无需装包）
+
+- 推翻旧的 UI 自动化方案：企业微信 PC 客户端（窗口类 WeWorkWindow，Perry 自绘框架）完全不暴露 UI Automation —— 子 HWND=0、UIA 子节点为空，读不到任何控件（已多次实测确认）
+- 新方案（零依赖）：PrintWindow(PW_RENDERFULLCONTENT) 截取窗口 → 放大 2 倍 → Windows 自带 OCR（Windows.Media.Ocr，zh-Hans-CN）→ 按坐标切出左侧会话列表与右侧消息区；被遮挡 / 非前台也能截，不抢焦点
+- 点击用 PostMessage(WM_LBUTTONDOWN/UP) 直接投递给窗口，不移动用户的鼠标、不抢前台；滚到消息底部用 WM_MOUSEWHEEL
+- 只点开「预览命中加急关键词（加急/尽快/优先）」的会话（预览会被省略号截断，必须点开才读得到完整报案号）；每轮最多点开 max_rows 个，默认 8
+- 报案号提取做了 OCR 混淆字符校正：O/o→0、I/l/|/i→1、S/s→5、B→8，并且去掉 OCR 插入的空格；OCR 文字常紧贴中文导致 \b 边界失效，改为无边界捞候选 + fullmatch 校验
+- 会话指纹去重持久化到 data/urgent/wxwork_seen.json，重启不会重复入队；命中后进既有加急队列（bot.urgent），由挂机循环插队处理
+- GUI：『自动扫描企业微信新消息』开关 + 『🔍 立即扫描企微』+『🧪 诊断识别效果』（导出 data/logs/wxwork_ocr.txt 便于核对识别率）
+- 已知副作用：点开会话会把该会话标为已读（企业微信没有只读接口）；不支持时会在界面/日志里如实报错，不会假装成功
+- 实测：一次截图+OCR 约 0.95 秒；会话列表 11 行正确切分；完整报案号识别正确，如 RDZA2026110000N0489545 / RDAA2026110000N0525510
+
+## v3.6.4 · 2026-10-30 · 修两类逻辑错误：乱点编辑按钮 + VIN 超时 + 生产 SPA 路由
+
+- 【严重 bug 修复】STEP 2 乱点门户首页表格的『编辑』按钮（编辑备注用，不是打开定损平台）。根因：STEP 1 没找到 quote 页面时 fallback 到 portal 首页，STEP 2 继续往下跑 → 在首页上 button:has-text('编辑') 命中表格的操作列按钮。现在 STEP 2 在找『编辑』前强制校验 URL（quote/index 或 quote_process）或页面 DOM 存在 #editButtons，都没有直接抛 RuntimeError 跳过本案件，不再误点
+- STEP 2 编辑按钮候选选择器全部提前 —— #editButtons 容器内按钮先、通用兜底按钮后（不再把 button:has-text('编辑') 放前面），避免 quote 页还在 portal 时抢匹配
+- STEP 4 VIN 提取改成逐个选择器尝试 + 诊断：不再用逗号组合选择器；每个候选 (#loss-vin / [data-field=vin] / [id*=vin] / [class*=vin] / .vin-value 等) 单独尝试，命中后打印选的哪个；全部失败时打印所有 frame 的 URL + body 前 300 字 + 已尝试的每个选择器结果
+- STEP 4 等待加固：confirm 之后 SPA 重渲染 → 加了 networkidle + 1.5s 稳定期 + DEFAULT_TIMEOUT 兜底
+- STEP 1 新增 SPA 同页路由等待：popup 检测失败后再等 15 秒，轮询当前页 URL 是否变成 quote/index（生产门户可能 SPA 同页跳转，不新开标签）
+- find_claim_link 保持精确文本优先（兼容 mock），行内 <a> / [onclick] / <tr> 点击当兜底（兼容生产）
+- 验证：mock 10 零件全流程 + 无换件案件均 🎉 成功完成，VIN 正确提取
+
+## v3.6.3 · 2026-10-30 · 升级为通用弹窗检测（覆盖所有 UI 框架 + 遮罩兜底）
+
+- 生产根因修复（16:27 运行日志 + 用户截图）：定损平台同步定损弹窗是 **Bootstrap modal**（class="modal fade in"，标题「提示」、内容「确定同步全部配件项目吗？」），不是 Element UI 的 el-message-box；旧版只找 .el-message-box → dump_visible_overlays 已打印弹窗却没人点
+- confirm_el_messagebox → confirm_dialog，三层检测策略：① 知名框架专用选择器（Element UI / Bootstrap modal / Ant Design / Layui / jQuery UI）② 通用 role/dialog/popup 关键字 ③ JS 兜底扫所有 z-index>=100 的遮罩，里面必须含「确定/确认/OK」按钮 → 命中后自动点
+- _el_messagebox_text 同步升级为通用 _dialog_text：读弹窗文本判断结果时不再漏掉 Bootstrap/Antd/Layui 的弹窗
+- 向后兼容：confirm_el_messagebox / _el_messagebox_text 作为别名保留，所有既有调用点无需改动
+- 验证：mock 常规 10 零件全流程回归 🎉 成功完成；compileall 通过
+
+## v3.6.2 · 2026-10-30 · 修复同步定损确认框点不掉：弹窗在 iframe 里
+
+- 生产复盘（16:00 运行日志）：点「同步定损」成功，但 10 秒内没检测到确认框 → STEP 4 等不到 VIN 超时跳过；原因是 el-message-box 渲染在定损平台的 iframe 里，v3.6.0 的 confirm_el_messagebox 只查主文档
+- confirm_el_messagebox 改为遍历所有标签页的所有 frame（含嵌套 iframe）找 .el-message-box 并点「确定」；_el_messagebox_text 同步跨 frame（提交结果判断也不再漏 iframe 里的提示）
+- 新增 dump_visible_overlays 诊断：若再遇到点不掉的弹窗，日志会列出当前所有可见顶层弹层（class/文字），把这几行发回来即可补规则
+- 验证：iframe 内 el-message-box 单元测试 PASS（自动点确定、同步生效）；mock 常规原生弹窗路径回归成功
+
+## v3.6.1 · 2026-10-30 · 「提交定损单」后的「提交成功」提示框自动点「确定」
+
+- STEP 8 每次点「提交定损单」后轮询 el-message-box 并自动点「确定」（成功/失败提示都覆盖），不影响失败重试逻辑
+- 所有提交结果等待（_wait_page_result：报价完成/提交上级/任务转回等）同步识别 el-message-box 文本：命中成功/失败关键词时先自动点「确定」关掉再继续，避免提示框挡住后续操作
+
+## v3.6.0 · 2026-10-30 · 同步定损的 Element UI 确认框自动点「确定」
+
+- 生产同步定损弹的是 Element UI el-message-box（「同步成功后…确认同步定损？」取消/确定），不是浏览器原生弹窗，程序原来只自动处理原生 dialog → 卡住
+- STEP 3 点完「同步定损」后轮询所有标签页找 el-message-box 并自动点「确定」，点完后顺手再处理一轮后续成功提示
+- mock 定损平台新增 ?elmsg=1 复刻生产确认框（点确定才真正同步），单元测试验证：自动点确定 → 同步完成
+- 常规原生弹窗路径回归不受影响
+
+## v3.5.9 · 2026-10-30 · 修复 STEP 2 点不开定损平台：跟进报价处理新标签页
+
+- 生产实测日志定位：点报案号后报价处理页开在**新标签页**（/claimcar/32160/quote/index），但程序仍停在首页标签找『编辑』→ 点到列表行里的编辑链接，定损平台永远打不开（用户手动点的那个反而能开）
+- STEP 1 现在返回报价处理所在页面：expect_popup + 新标签页身份轮询 + quote/index/报案号 URL 兜底，STEP 2 / STEP 9 / STEP 9c 全部改用该页面操作
+- STEP 2 在报价页上先等 #editButtons 挂载（20s）再点，避免 SPA 渲染慢时误点页面里其他『编辑』
+- 定损平台标签识别不再依赖固定 URL：新标签按对象身份识别（不限 URL），并补充 vehicle/?damageId=（生产定损平台 10.28.15.151:8090）与标题含「定损」兜底
+- 挂机结束案件后自动关闭报价/定损标签页，URL 规则同步补充生产定损平台格式
+
+## v3.5.8 · 2026-10-30 · 移交目标默认值改为 17247339-胡晨光
+
+- TRANSFER_TARGET_DEFAULT: 17247339-胡晓光 → 17247339-胡晨光；mock 任务中心弹窗预填值同步更新
+- GUI 控制台『移交目标』输入框仍可随时覆盖
+
+## v3.5.7 · 2026-10-30 · 程序拉起的浏览器显示修复：去警告横幅 + 同步你的页面缩放
+
+- 调试端口只是控制通道、不改变渲染；显示不全的真因是启动参数横幅和独立 profile 的默认缩放
+- 启动参数移除 Playwright 默认的 --no-sandbox（窗口顶部黄色『不受支持的命令行标记』横幅，挤占可视高度）和 --enable-automation（『受到自动测试软件的控制』信息条）
+- 启动前把你日常 Chrome 的页面缩放设置（默认缩放 + 按站点缩放）合并进程序 profile 的 Preferences，窗口内容显示和你手动用的浏览器一致
+- 验证：进程命令行已不含 --no-sandbox / --enable-automation，调试端口正常；无自定义缩放时同步逻辑安全跳过
+
+## v3.5.6 · 2026-10-30 · 修复生产读不到报案号 + 重复启动 Target closed
+
+- 根因①：首页报案号正则 CLAIM_NO_RE 写死 RDZA 前缀（mock 格式），生产 RDAA+18 位永远匹配不到 → 界面 57 条案件程序读 0 条；改为 RD+2位字母+16~20位，mock/生产通吃
+- 用你保存的生产首页 HTML 快照直接验证：读到整页 10 个报案号（9 个 RDAA），mock RDZA 格式保持兼容
+- 根因②：程序拉起的浏览器（portal_profile / chrome_bot_profile）运行后保持打开，再次启动时同 profile 的 Chrome 被单例机制顶掉秒退 → Playwright 报 'Target page, context or browser has been closed'，单步测试直接失败
+- 修复：程序浏览器改用固定调试端口启动（门户 9333 / 一车一件 9224），下次启动先探测并直接接管旧实例；仍启动失败时按 user-data-dir 清理占用进程后自动重试一次
+- workflow_diff / recorder 的报案号归一化模式同步泛化（RDZA\d{10} → RD 通用格式）
+
+## v3.5.5 · 2026-10-30 · 提交定损单偶发「提交失败，请联系管理员」→ 点确定后自动重试
+
+- STEP 8 点击「提交定损单」后自动检测提示框（主文档 / 定损平台 iframe / 新标签页都扫），命中即点「确定」关闭
+- 关闭后自动重试「提交定损单」，最多 3 次；重试前若诊断对话框被关闭会自动重新点「提交」打开
+- 3 次仍失败时打印告警并在审计日志留痕，不再静默按成功继续
+- mock 定损平台支持 ?fail_first=1：第一次提交必失败一次，用于回归该场景
+- 验证：模拟首提交失败 → 识别提示 → 点确定（诊断框仍保留）→ 第二次提交成功，单元测试 PASS
+
+## v3.5.4 · 2026-10-30 · 一车一件真实外网也支持接管已打开的浏览器
+
+- RealMarket 新增 CDP 复用：连接你已打开的浏览器，优先找 URL 含 dataenlighten 的一车一件标签；没有就在同一个浏览器里新开一个标签（不另起独立窗口）
+- CDP 地址优先读 MARKET_CDP_URL，留空则复用门户的 PORTAL_CDP_URL；仍留空时自动探测 9222/9223/9224/9333
+- 从 CDP 接管时 close() 只断开连接，不会关闭你的浏览器；自建 persistent 浏览器的行为不变（保持打开以复用登录态）
+- 控制台「一车一件走真实外网」下方新增说明：真实外网同样接管上面那个已打开的浏览器
+- 验证：Edge --remote-debugging-port=9227 启动 → RealMarket 接管成功（label=real-cdp，页面为 market_home），全程未新开窗口
+
+## v3.5.3 · 2026-10-30 · 控制台新增「🔗 连接」：一键接管已在运行的浏览器
+
+- 控制台「复用已开」输入框右侧新增 🔗 连接 按钮：一键探测 9222/9223/9224/9333 端口
+- 探测成功自动把 CDP 地址填进输入框，并列出该浏览器所有标签页（标题 + URL），理赔门户标签标注『← 推荐（理赔门户）』
+- 探测失败时直接打印带参数的浏览器启动命令（--remote-debugging-port=9222 --user-data-dir=...），并提示调试端口只能启动时开启
+- 纯 HTTP 探测（/json/list），不依赖 Playwright、不会关闭或干扰你已打开的浏览器
+- 验证：本地以 Edge --remote-debugging-port=9222 启动 → 正确识别端口并读回标签列表
+
+## v3.5.2 · 2026-10-30 · STEP 9 按生产实测元素定位底部「提交(D)」按钮
+
+- 生产报价页实测底栏：<div class="picc-bottom-bar buttonClass"><div class="right-link-button">返回(F) / 暂存(S) / <button class="el-button el-button--text el-button--primary"><span>提交(D)</span></button>
+- 新增统一选择器组 QUOTE_SUBMIT_SELECTORS：.picc-bottom-bar .right-link-button button:has-text('提交') → button:has-text('提交(D)') → 通用兜底，并在点击前自动滚动到按钮
+- STEP 9 首次提交、提交上级（超权限补救）、返回报价页后提交三处全部改用该选择器组
+- mock 报价页底栏同步复刻 picc-bottom-bar / left-info / right-link-button 结构，按钮文字改为 提交(D)、el-button--text el-button--primary
+- 验证：定损提交命中 #submit-loss-btn、报价提交命中 #submit-quote-btn，单案全流程成功
+
+## v3.5.1 · 2026-10-30 · STEP 2 按生产实测元素定位「编辑」按钮
+
+- 生产报价页的「编辑」实测为 <div id="editButtons"><button class="el-button el-button--primary el-button--mini"><span> 编辑 </span></button></div>，STEP 2 新增 #editButtons button / #editButtons .el-button / #editButtons span 三个首选选择器（在通用文字兜底之前）
+- mock 报价页同步复刻该结构（div#editButtons + el-button--primary el-button--mini + 文字前后空格），保证模拟环境与生产一致
+- 验证：mock 单案 STEP 2 正常打开定损平台并完成全流程
+
+## v3.5.0 · 2026-10-30 · 按生产快照完整复刻三个 mock 业务页面（滚动 + 按钮）
+
+- 首页：Element UI 风格宽表（列总宽 2680px），表格容器固定高度 + overflow:auto，横向/纵向都能滚动；12 条数据、行尾 el-button--text「编辑」、顶部查询/分页与左侧菜单
+- 报价处理：长文档式案件信息 / 车辆信息 / 定损单金额 / 维修费用清单；「编辑」按钮放到首屏之外（约 1600px 处）；零件表放入独立纵向滚动容器；底部固定操作条「返回(F) / 暂存(S) / 提交(D)」+ 左下『1/7-当前任务为【定报核】流程!』状态条
+- 定损平台：AdminLTE 风格；底部固定 footer（#carSubmit 提交、#submitBaseInfo 暂存、#auditBtn 审核诊断）；换件信息 #evalPartDiv 与 #tbdsBtn 同步定损位于首屏之外，换件表可纵向滚动
+- 保留全部自动化依赖的 id 与行为（#claim-table/.claim-no/.open-quote-btn、#open-loss-edit、#parts-tbody/#select-all-parts/#sync-loss-btn/#submit-loss-btn/#diagnosis-modal、window.__synced、报价提交与提交上级弹窗等）
+- 验证：单案 10 个零件全流程成功；连续两案（含超权限补救 STEP 9a/9b/9c）均成功
+
+## v3.4.3 · 2026-10-30 · 生产门户是 Vue SPA + 内嵌 iframe 操作条：按钮与表单跨 frame 定位
+
+- 确认生产门户 /claimcar/32160/ 是 Vue SPA（<div id=app>），定损/报价表单与底部『返回/暂存/提交』操作条都嵌在 iframe 里，主文档只有脚本，所以按主文档找按钮一定找不到
+- 按钮定位新增第三层兜底：Playwright 定位（button/input/a/[role=button]/class 含 btn 的包含文字匹配，支持『提交(0)』这种写法），跨域 iframe / 深层嵌套窗口也能命中
+- 文字智能扫描支持 Shadow DOM（Vue 组件可能把操作条挂在 shadowRoot）
+- 定损表单改为逐 frame 读取：VIN、报案号、换件表、全选复选框、同步定损按钮，SPA 内嵌窗口里也能读/点
+- 编辑与提交按钮等待时间加长（编辑 12s、定损提交 8s、报价提交 12s），等 SPA 渲染完再判定
+- 『📸 采集生产页面』现在同时保存每个 iframe 的 HTML 和控件摘要（frame-*.html），便于对准操作条结构
+- 首页 0 条诊断新增逐 frame 文本预览，能直接看出列表在哪个 frame 里
+
+## v3.4.2 · 2026-10-30 · 首页只读到一次、之后一直 0 条的自愈与诊断
+
+- 报案号读取改为逐 frame 扫描（真实门户的列表常在 iframe/frameset 里，只读主页面 body 会漏）
+- 读到 0 条时打印诊断：当前 URL、页面标题、frame 数、是否出现登录/404 提示、body 前 160 字
+- 读到 0 条时依次尝试：点击『查询』重新加载 → 进入『我的案件 / 待办案件 / 待处理 / 案件列表 / 待办事宜』菜单再扫
+- 仍为 0 条：自动重新打开首页（domcontentloaded + 等待网络空闲）再扫一次；仍 0 会明确提示把日志发回
+- 修复 _close_popup 引用不存在的 env.portal_page 导致报价/定损标签页从未关闭（越堆越多影响回首页）
+
+## v3.4.1 · 2026-10-30 · STEP 2 兼容无 popup；真实浏览器窗口最大化（定损平台底部提交栏可见）
+
+- 实际运行数据复盘：12:37:33 已命中并点击「编辑」，但 15s 内没有任何 popup → 定损平台窗口从未打开，所以浏览器底部那条『返回/暂存/提交』看不到
+- STEP 2 不再硬等 popup：依次接受『新窗口』『新标签页』『复用同名窗口被导航』『同页打开』四种情况；都不成立时打印所有标签页 URL 并继续在当前页执行
+- 真实门户 / 一车一件 的浏览器窗口改为最大化启动（viewport=None + --start-maximized + --window-size=1600,900），不再固定 1440×900，页面底部工具条按真实窗口尺寸显示
+
+## v3.4.0 · 2026-10-30 · 动作捕捉增强：iframe / 非标准按钮 / 新窗口 / 系统响应
+
+- 点击识别范围扩大：除 button/a/input 外，div/span/li/td、手型光标、class 含 btn/link/tab/menu 的控件都能捕捉，未知控件兜底也记一条（生产门户大量用 div 当按钮）
+- iframe / frameset 门户：主页面与每个 frame 都注入录制脚本、都拉取动作，解决“生产环境完全录不到动作”
+- 新窗口 / 新标签页自动接管并记录 open；页面跳转、窗口关闭、window.open、alert/confirm/prompt、表单 submit 统一记录为动作
+- 新增系统响应记录：XHR / fetch / 页面文档的请求方法 + URL + 状态码，动作报告新增「系统响应」表格
+- 录制中每 6 秒打印诊断（窗口数 / frame 数 / 已注入数 / 累计动作）；0 注入或 30 秒 0 动作时提示“你可能在别的浏览器里操作”
+- 录制页提示：只在『程序打开或接管』的浏览器窗口里操作才会被记录
+
+## v3.3.3 · 2026-10-30 · 编辑/提交按钮改为滚动+文字定位（真实门户按钮在页面下方）
+
+- 新增 find_clickable：先按 CSS 选择器找（主页面 + 所有 iframe），找不到再按文字智能扫描，命中后自动 scrollIntoView 到可视区域再点击
+- 真实门户『编辑』『提交』都在页面下方、需要滚动才能看到，现已统一滚动后点击；找不到时打印候选元素文字，便于补选择器
+- STEP 2 编辑、STEP 8 定损提交、STEP 9 报价提交、转回后报价提交全部改用该逻辑
+- 模拟环境同步改造：报价处理页『编辑』『提交』、定损平台『提交』都放在需要下拉滚动的位置，mock 回归通过
+- 实测 360 安全浏览器（360se）屏蔽 DevTools：进程带 --remote-debugging-port 也不监听端口，Playwright 直接启动报 TargetClosed → 选 360 时自动改用 Chrome 并明确提示；需要 360 界面请装 360 极速浏览器（Chromium 内核）
+
+## v3.3.2 · 2026-10-30 · 门户 404 自动返回首页 / 接管已打开浏览器 / 界面设置持久化
+
+- 真实门户跳到 404 时自动点页面中间『返回首页』，并记住正确首页地址（data/config/portal_home.json），刷新/重启不再卡在 404 看不到报案号
+- 未填写 CDP 时自动探测本机 9222/9223/9224/9333 上已启动的浏览器并接管；接管时优先选门户首页标签，跳过报价/定损等详情页
+- 浏览器下拉选 360：先用调试端口拉起 360 再接管；实测 360 安全浏览器（360se）不支持调试端口、也无法被 Playwright 直接驱动，会自动回退 Edge/Chrome 并明确提示
+- 新增 360 安全浏览器候选路径 C:\Chrome-bin\360se.exe；界面设置（浏览器/自定义路径/CDP/刷新间隔/容忍度）持久化到 data/config/ui.json
+- STEP 2『编辑』按钮支持多选择器兜底（#open-loss-edit → a/button/input/img/text『编辑』），匹配不到时提示用『📸 采集生产页面』补采结构
+- 修复录制/采集结束时控件已被销毁导致的 Tk 报错（按钮状态切换统一兜底）
+
+## v3.3.1 · 2026-10-30 · 挂机改为持续轮询等待新案件
+
+- 结束条件调整：刷新确认后仍没有待处理报案号时不再结束挂机，而是按刷新间隔持续轮询，直到手动『停止』或达到处理上限
+- 刷新间隔可配置：GUI『运行参数』新增『刷新间隔』（秒，默认 10）、CLI 新增 --poll-interval、config.LOOP_POLL_INTERVAL
+- 轮询等待分段检查停止标记，点『停止』最多 1 秒内生效，停止不再记为异常日志
+- 『列表里案件都已处理过』分支同样按刷新间隔轮询，保持行为一致
+
+## v3.3.0 · 2026-10-30 · 价格容忍度改为绝对金额
+
+- 价格容忍度参数语义变更：由「百分比」改为「绝对金额（元）」，如填 2 表示本地价超出市场价 2 元以内都不算超市场价
+- PartItem.check(tolerance_amount)：阈值 = 市场价 + 容忍金额，并在 STEP 6 查询市场价时真正生效（此前容忍度只存在于参数中、实际比对未使用）
+- config.PRICE_TOLERANCE_PERCENT → PRICE_TOLERANCE_AMOUNT（默认 0）；CLI --tolerance 帮助文案同步更新
+- GUI『运行参数』：单位由 % 改为 元，提示改为『超过市场价此金额以内不算超』，输入 2 即代表 2 元
+- 单步/挂机日志：容忍度改为显示 ¥金额；STEP 6 输出容忍金额与判定结果
+
+## v3.2.1 · 2026-10-30 · 列表刷新确认（业务系统需刷新才更新）
+
+- PortalPort / MockPortal / RealPortal 新增 refresh()：强制 page.reload，真实门户为 SPA / hash 路由时重新 goto 不会真正刷新列表
+- 挂机循环：当前页面列表没有新任务时，先刷新页面并重新读取报案号（默认连续 2 次、间隔 4s），确认是否真的有新任务
+- 刷新后出现新任务 → 继续处理；刷新确认仍无任务 → 才结束挂机，避免误判『没有任务』提前停机
+- 刷新失败自动降级为重新打开首页；新增日志『列表无新任务 → 刷新确认』便于事后核对
+
+## v3.2.0 · 2026-10-30 · 企业微信加急插队
+
+- 新增 bot/urgent.py：从企业微信消息里识别报案号（RD+2 位字母+16~20 位）与加急关键词，入队后由挂机循环优先处理
+- 加急判定可配置：data/config/urgent.json 里的关键词列表（默认 加急/尽快/优先），可勾选『仅命中关键词才算加急』
+- 消息来源两种（都不依赖企业微信 UI 自动化，稳定性优先）：① data/urgent/inbox 收件箱（丢 .txt 即自动入队，后台每 5s 扫描）② GUI『⚡ 加急插队』页粘贴/读剪贴板
+- 队列持久化 data/urgent/queue.json：重启保留、按入队顺序、自动去重、上限 200 条
+- 挂机循环改造：每轮扫描先看加急队列 → 首页确实存在且未处理过的加急案件优先；当前案件处理完成后才插队，不打断正在处理的案件
+- 防堆积保护：加急案件连续 10 轮扫描都没在首页出现 → 自动放弃并记录日志；已处理/已跳过自动出队
+- 新增侧栏『⚡ 加急插队』页：粘贴识别预览、待插队队列、关键词增删保存、收件箱入口，全程线程安全 + 异常兜底
+
+## v3.1.0 · 2026-10-30 · 智能识别记录 · 生产环境页面采集 + 人工操作学习
+
+- 新增 bot/capture/snapshot.py：采集当前页面代码（page.html）、表单控件、下拉选项、表格结构、整页截图到 data/capture/<时间>-<名称>/
+- 新增「生产 vs mock」结构差异报告：自动指出 mock 缺少的控件 / 下拉选项 / 表格表头，直接照报告改 mock_web
+- 新增 bot/capture/actions.py：复用 bot/recorder.py 在浏览器里记录人工操作，输出 actions.jsonl + actions.md 改进草案
+- 改进动作录制：内存 buffer 改为 sessionStorage 持久化，整页跳转（点报案号 / 翻页）不再丢失已录动作；输入框增加 input 事件防抖记录
+- 动作草案自动映射到流程标准步骤 STEP 1→9 / 9a / 9b：给出未映射动作、重复点击、未走到的步骤、人工填写值等改进建议
+- 新增 bot/runners/capture.py：run_capture(kind=page/actions) 复用 EnvSpec / build_environment / Recorder，采集结果同样落 data/compare 运行记录
+- 「📼 录制学习」页整合：录制人工操作与采集生产页面两个入口，环境跟随控制台『运行模式 / 环境』（选『真实循环挂机』即生产环境）
+- 录制结果仍兼容老格式 data/workflows/<名称>.json，可直接在『🔍 流程比对』页与程序黄金标准做差异比对
+- 控制台「版本与日志」卡与录制页新增「📸 采集目录」入口，一键打开 data/capture
+- 真实门户采集增强：一车一件首页会一并打开采集；采集 mock 做对比时也会打开 mock 市场页，避免空白页造成假差异
+
+## v3.0.0 · 2026-10-30 · 分层架构 · 四种运行方式共用一套流程逻辑
+
+- 整体分层：bot/core（接口契约 + 运行记录）→ bot/envs（模拟/真实环境适配器）→ bot/flows（唯一流程逻辑）→ bot/runners（运行方式）→ bot/main（薄入口）
+- 新增 bot/core/ports.py：PortalPort / MarketPort 两个 Protocol 接口，流程只依赖接口，不依赖具体站点实现
+- 新增 bot/core/records.py：每次运行逐步记录 StepRecord / RunRecord，落盘 data/compare/*.json
+- 新增 bot/envs：MockPortal / RealPortal（支持 CDP 接管与独立 profile）、MockMarket / RealMarket，由 EnvSpec 装配成 Environment
+- 新增 bot/flows/claim_flow.py：STEP 1→9 唯一流程逻辑（含无换件分支、超权限补救 9a/9b/9c、演练模式），不再分散在多处
+- 新增 bot/runners：run_single（单次/单步）/ run_loop（循环挂机）/ run_manual（人工测试），全部调用同一个 run_claim_flow
+- 新增人工测试模式：人工在浏览器操作，程序只观察校验每一步是否达成，记录 ○ 未观察 / ✅ 已达成
+- 新增自动对比：同一报案号跨环境（模拟 vs 真实）或人工 vs 自动自动生成 Markdown 对比报告，可互相印证
+- 控制台新增「运行模式」下拉：模拟循环挂机 / 真实循环挂机 / 单步测试 / 人工测试，一处切换；环境开关收纳为『环境』区
+- 「版本与日志」卡新增「🔍 对比报告」按钮，一键打开 data/compare 目录
+- bot/main.py 精简为命令行入口与向后兼容封装，CLI 新增 --portal-real / --cdp / --dry-run / --manual
+
+## v2.5.1 · 2026-10-30 · 理赔门户可走真实内网 · 支持接管已打开的浏览器
+
+- 修复「生产环境已打开真实理赔门户，程序却仍打开自己的浏览器访问本地模拟页」：控制台新增「理赔门户走真实内网」开关，勾选后直接访问真实门户
+- 启动时自动探测内网门户是否可达（TCP 探测，2 秒超时）：可达则默认勾选真实门户，不再误开模拟页；不可达才用本地模拟页
+- 新增「复用已开」CDP 地址（如 http://127.0.0.1:9222）：可接管你自己已打开的浏览器窗口，程序不再新开窗口、无需重复登录
+- 真实门户模式使用独立 profile 目录（data/portal_profile），登录一次永久复用，不抢占日常浏览器登录态
+- 真实门户未登录时程序会提示并自动等待（最长 240 秒），登录完成后自动继续，超时才报错
+- 门户就绪判定改为不依赖具体 DOM 的报案号文本扫描（find_claim_rows / find_claim_link），模拟页与真实内网通用
+- 控制台左列改为可滚动：参数项变多后（浏览器 / 门户 / 复用已开）不再裁掉「版本与日志」卡片
+
+## v2.5.0 · 2026-10-30 · 多浏览器支持 · 修复生产环境浏览器不存在
+
+- 修复生产环境报错 Executable doesn't exist：打包版 exe 不含 Playwright 内置 Chromium，现改为优先使用本机已安装的浏览器
+- 新增 bot/browser.py：自动探测 Chrome / Edge / 360（含 360极速/极速X/安全浏览器）安装路径，找不到才回退内置 Chromium
+- 控制台「运行参数」新增浏览器下拉（auto/chrome/edge/360/custom）与自定义路径输入框，实时显示实际会用的浏览器及路径
+- 指定浏览器未安装时明确提示并自动改用其它可用浏览器，不再静默失败
+- 四处浏览器启动（门户单次、门户挂机、一车一件 mock、一车一件真实 persistent）统一走同一套解析逻辑
+- 真实外网仍使用独立 profile 目录，不会抢占日常 Chrome/360 的登录状态
+
+## v2.4.0 · 2026-10-29 · 人工点击与程序点击等效（幂等步骤）
+
+- 单步调试暂停期间人工在浏览器里的操作现在会被程序识别：各 STEP 改为「先检测页面状态，已达成就跳过点击」
+- STEP1 已在报案号处理页则跳过；STEP2 定损平台已开则复用；STEP3 检测到已同步则跳过；STEP5 已在详情页则跳过 VIN 查询；STEP8 诊断弹窗已开则直接点提交定损单；STEP9 提交弹窗已开则直接确认
+- 新增 click_if_present / is_visible_now 辅助：找不到目标元素时 3 秒内判定为人工已操作，跳过而不是超时卡死
+- 浏览器上下文注册全局原生弹窗自动接受：人工点击触发的 alert/confirm 不再阻塞程序动作
+- mock 同步定损增加 window.__synced 状态标记，人工与程序点击置同一状态
+- 验证：人工预点报案号/编辑/同步/提交四个场景程序全部正确识别并跳过；全自动回归流程正常 done
+
+## v2.3.4 · 2026-10-29 · 流程编辑器支持节点参数 + 提交上级参数自动填
+
+- 流程编辑器属性面板新增「参数 kwargs」区：可查看/编辑节点参数，也可新增参数（如 staff_code）
+- 「提交上级」节点默认带 5 个参数：submit_path=九级报价、group_option=1100000000005175-市公司报价组、group_code=5175、group_key=市公司报价组、group_exclude=废弃
+- step_quote_submit_superior 改为参数化：优先取编辑器节点参数，留空自动回退 bot/config.py 默认值，运行时打印实际使用的参数
+- 真实执行链（bot/main.py）新增 _workflow_step_kwargs，从 main_flow.json 读节点参数并把提交路径/组别代码传给 9a，改配置无需改代码
+- 人员代码支持可选 staff_code：配置了就填（只读时跳过并记日志），未配置则保持为空由处理组自动分配
+- 右侧属性面板宽度 260 → 320，较长的组别代码完整值不再被裁切
+
+## v2.3.3 · 2026-10-29 · 流程编辑器同步权限不足补救分支
+
+- build_default_workflow 新增条件分支 C：报价完成 → 判断是否被权限拦截 → YES 走『提交上级 → 平级移交回本人 → 重开报价页报价完成』三步补救链
+- 主流程节点从 11 个增至 15 个，data/workflows/main_flow.json 已重新生成
+- 新增三个补救 step（quote_submit_superior / task_transfer_back / quote_reopen_finalize）已出现在编辑器左侧 call_step 下拉，可拖拽使用
+- 说明：真实执行由 bot.main._finalize_with_fallback 以异常驱动方式实现，workflow 仅用于可视化表达与条件分支编排
+
+## v2.3.2 · 2026-10-29 · 提交上级后补做「报价任务提交」弹窗
+
+- 真实站点在『业务动作=提交上级』提交后会弹出『报价任务提交』：提交路径选择=九级报价、组别代码=5175 → 下拉选「1100000000005175-市公司报价组」，再点弹窗内的『提交任务』
+- 组别代码采用「优先填完整值 + 回车/精确匹配，失败退回 5175 + 选非废弃项」的双策略，自动排除带「（废弃）」的干扰项；人员代码保持为空（由处理组自动分配）
+- 弹窗控件全部优先按 id 定位，文本兜底只在弹窗范围内查找，避免误点到页面其它『提交任务』按钮
+- mock 增加该弹窗与下拉过滤逻辑，金额超限案件可完整演练「提交上级 → 平级移交 → 报价完成」
+- 验证：超限案件 end-to-end 成功，普通案件未误触发，挂机 2 单均成功
+
+## v2.3.1 · 2026-10-29 · 控制台布局适配新增的移交目标参数
+
+- 控制台「运行参数」卡新增「移交目标」行（工号-姓名，默认 17247339-胡晓光），超权限案件平级移交时使用
+- 收紧控制台三卡的垂直间距，「版本与日志」卡改为版本号与日志目录按钮同行，避免新增参数后卡片被窗口底部裁切
+- 「价格容忍度」提示文案缩短，避免右侧被截断
+
+## v2.3.0 · 2026-10-29 · 超出权限金额案件自动执行提交上级 + 平级移交兜底
+
+- 新增 bot/routing.py：集中路由 normal / high_amount + is_permission_error 权限类提示判断
+- 不预判金额：一律先走正常『报价完成』，仅当提交失败且页面提示权限不足时才切换 high_amount 补救分支
+- 补救动作序列：报价页『提交上级』+ 意见『权限不够，报上级审核』→ 任务中心平级移交回本人 → 重新报价完成 → 提交
+- 新增 STEP 9a/9b/9c 三个 step：step_quote_submit_superior / step_task_transfer_back / step_quote_reopen_finalize
+- run() / run_loop() STEP 9 统一接入 _finalize_with_fallback：权限类异常自动补救，非权限异常保持原有失败/跳过逻辑
+- 平级移交目标人员做成可配置：GUI 控制台新增『移交目标』输入框，默认 17247339-胡晓光，经 ctx.transfer_target 传入流程
+- config.py 新增报价页业务动作/意见/结果提示、任务中心平级移交等多候选选择器常量，并补 TASK_TRANSFER_URL
+- mock 新增 task_center_transfer.html（报案号查询 + 行移交 + 任务提交弹窗），quote_process 增加『提交上级』及 >4 万金额权限不足提示
+- mock 新增 RDZA2026110000502491 高额案件（定损金额 56180）用于离线演练整条兜底链路，index 增加任务中心入口
+- 补救步骤找不到成功提示时抛出带中文说明的异常（选择器待真机确认），不静默判定成功
+
+## v2.2.3 · 2026-10-29 · 挂机遇不支持案件自动跳过并记录卡点
+
+- 任意 STEP 抛异常时不再反复重试该案件：把报案号加入本轮已处理集合，跳过并继续处理下一个
+- 跳过时记录「报案号 + 卡在哪一步 + 原因」到 data/skipped/跳过案件.jsonl，同时在 Excel 台账写一条 status=skipped 的记录
+- StepGate.checkpoint 在非单步模式下也记录 current_step，异常时能准确知道卡点（原来挂机模式永远记录不到步骤）
+- 单步/连续执行失败时，错误日志与台账备注同样带上卡住的 STEP
+- 挂机结束打印汇总：共处理 / 成功 / 跳过，并列出跳过案件
+- 修复跳过分支中 loss_page 未定义导致的 NameError，并统一关闭定损平台弹窗
+
+## v2.2.2 · 2026-10-29 · 单步测试支持演练模式
+
+- 单步测试页新增「🛡 演练模式」勾选（默认关闭）：跑完取号 → 同步定损 → 提取零件 → VIN 查询 → 比价 → 修复，然后停在提交前
+- 演练模式下跳过『提交定损』与『报价完成』两个提交类 STEP，不写 Excel 工作记录，避免测试数据污染正式台账
+- bot.main.run() 新增 dry_run 参数，状态记为 dry_run，运行日志与审计日志均标注演练模式
+- 演练模式不作用于循环挂机（挂机仍按正式流程执行）
+
+## v2.2.1 · 2026-10-29 · 精简侧栏 · 移除冗余自动运行页
+
+- 移除侧栏「🤖 自动运行」页：其开始/停止、循环开关、已处理计数、流程进度均已迁至控制台，剩余仅为说明文字与重复日志盒
+- 侧栏精简为 6 个入口：控制台 / 单步测试 / 流程编辑器 / 录制学习 / 流程比对 / 日志中心
+- 循环挂机说明保留在控制台「运行状态」卡的副标题中，不丢失操作指引
+
+## v2.2.0 · 2026-10-29 · 控制台首页 · 布局重构
+
+- 新增「🏠 控制台」作为程序首页：左侧运行状态 / 运行参数 / 版本与日志三张卡片，右侧流程进度 + 实时运行日志
+- 顶栏只保留 Logo 与名称，运行按钮、状态胶囊、容忍度、一车一件开关、版本号全部搬到控制台页
+- 原「循环挂机」页的循环开关、已处理计数、9 个 STEP 进度卡迁移到控制台，该页仅保留说明与日志
+- 页面切换后自动恢复真实运行状态（运行中按钮置灰、状态胶囊显示当前状态）
+- 日志盒增加边框，切换页面时日志流不再中断或丢失
+
+## v2.1.0 · 2026-10-29 · 日志中心 · 版本管理 · 挂机修复
+
+- 新增四类日志：系统日志 / 运行日志 / 操作日志 / 错误日志，按天分文件、8MB 轮转、保留 30 天
+- 日志格式统一为「时间 | 级别 | 分类 | 消息」，错误日志自动附带 traceback
+- 新增版本管理：版本号走 SemVer，CHANGELOG 记录每次主要变更，GUI 顶栏动态显示版本
+- GUI 新增「📄 日志中心」页：按分类查看日志尾部、一键打开日志目录
+- 修复「▶ 开始挂机」点击无反应：单步测试跑完后开始按钮未复位、Tab 判定失效
+- 修复「■ 停止」无效：新增全局停止开关，单步 / 连续 / 挂机三种模式均可立即停止
+- 所有点击 / 输入都会写入操作日志，便于事后追溯自动化动作
+
+## v2.0.0 · 2026-10-28 · 统一架构版
+
+- 整体重构：bot/page_objects 按 STEP 拆分，主流程 run() / run_loop() 统一编排
+- 定损平台进入后第一步改为「同步定损」，并支持无换件案件（空列表直接同步 → 跳过比价直接提交）
+- 新增单步调试：每个 STEP 前暂停，可「下一步 / 停止」，按调试器方式逐步执行
+- 新增「🧪 单步测试」页（报案号输入 + 连续执行 / 单步调试）
+- 新增循环挂机：自动刷新首页取待处理报案号，逐个处理并自动回首页
+- 新增流程编辑器 / 录制学习 / 流程比对（LCS 对齐）三个辅助页面
+- 新增工作记录 Excel（按月分文件，总览 + 零件明细双 Sheet）
+- 修复单步测试页报案号输入框塌陷导致按钮被挤没的问题

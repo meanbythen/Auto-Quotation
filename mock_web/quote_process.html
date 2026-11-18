@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>报价处理 - 理赔作业门户</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Microsoft YaHei", Arial, sans-serif; background: #f0f2f5; color: #303133; font-size: 13px; min-width: 1500px; padding-bottom: 86px; }
+  /* ===== 顶部 ===== */
+  .app-header { height: 50px; background: #fff; border-bottom: 2px solid #1c61fc; display: flex; align-items: center; justify-content: space-between; padding: 0 20px; }
+  .app-header .logo { display: flex; align-items: center; gap: 10px; font-size: 16px; font-weight: bold; color: #1c61fc; }
+  .app-header .logo .brand { background: #d0021b; color: #fff; padding: 2px 9px; border-radius: 3px; font-size: 13px; font-weight: bold; }
+  .app-header .user { color: #909399; font-size: 13px; }
+  .breadcrumb { background: #fff; padding: 10px 20px; border-bottom: 1px solid #e4e7ed; font-size: 13px; color: #909399; }
+  .breadcrumb a { color: #1c61fc; text-decoration: none; }
+
+  /* ===== 页面内容 ===== */
+  .page { padding: 14px 20px 20px; }
+  .picc-box { background: #fff; border: 1px solid #e4e7ed; border-radius: 4px; margin-bottom: 14px; }
+  .picc-box > .box-head { padding: 11px 16px; border-bottom: 1px solid #ebeef5; font-size: 14px; font-weight: bold; color: #303133; display: flex; align-items: center; justify-content: space-between; }
+  .picc-box > .box-head .head-left { display: flex; align-items: center; gap: 8px; }
+  .picc-box > .box-head .head-left::before { content: ''; display: inline-block; width: 3px; height: 14px; background: #1c61fc; border-radius: 2px; }
+  .picc-box > .box-body { padding: 14px 16px; }
+  .info-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px 24px; }
+  .info-item label { color: #909399; font-size: 12px; display: block; margin-bottom: 3px; }
+  .info-item span { color: #303133; font-size: 13px; }
+  .text-blue { color: #1c61fc; }
+  .text-danger { color: #f56c6c; font-weight: bold; }
+
+  .el-tabs { display: flex; border-bottom: 1px solid #e4e7ed; padding: 0 8px; margin-bottom: 12px; }
+  .el-tab { padding: 10px 16px; cursor: pointer; font-size: 13px; color: #606266; border-bottom: 2px solid transparent; }
+  .el-tab.active { color: #1c61fc; border-bottom-color: #1c61fc; font-weight: bold; }
+
+  .data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .data-table th { background: #f5f7fa; color: #606266; font-weight: bold; padding: 9px 10px; text-align: left; border-bottom: 1px solid #ebeef5; white-space: nowrap; }
+  .data-table td { padding: 9px 10px; border-bottom: 1px solid #ebeef5; white-space: nowrap; }
+  .data-table tbody tr:hover { background: #f5f7fa; }
+  .data-table .num { text-align: right; font-family: Consolas, monospace; }
+
+  /* 零件清单：真实纵向滚动容器 */
+  .parts-scroll { max-height: 240px; overflow: auto; border: 1px solid #ebeef5; border-radius: 3px; }
+  .parts-scroll .data-table { min-width: 1320px; }
+
+  .edit-row { padding: 12px 0 2px; }
+  .el-button { display: inline-flex; align-items: center; justify-content: center; height: 32px; padding: 0 16px; border-radius: 4px; border: 1px solid #dcdfe6; background: #fff; color: #606266; cursor: pointer; font-size: 13px; }
+  .el-button:hover { color: #1c61fc; border-color: #c6e2ff; background: #ecf5ff; }
+  .el-button--primary { background: #1c61fc; border-color: #1c61fc; color: #fff; }
+  .el-button--primary:hover { background: #1854db; border-color: #1854db; color: #fff; }
+
+  /* 报价意见 */
+  .quote-option { margin-bottom: 12px; }
+  .quote-option label { margin-right: 24px; font-size: 13px; cursor: pointer; }
+  .quote-option input[type=radio] { margin-right: 6px; }
+  .form-tip { font-size: 12px; color: #909399; margin-bottom: 6px; display: block; }
+  select, textarea { border: 1px solid #dcdfe6; border-radius: 4px; padding: 8px 10px; font-size: 13px; font-family: inherit; background: #fff; }
+  textarea { width: 100%; min-height: 80px; resize: vertical; }
+
+  /* ===== 底部固定操作条 ===== */
+  .app-footer { position: fixed; left: 0; bottom: 0; width: 100%; height: 56px; background: #fff; border-top: 1px solid #e4e7ed; box-shadow: 0 -2px 8px rgba(0,0,0,.05); z-index: 120; display: flex; align-items: center; justify-content: space-between; padding: 0 20px; }
+  .footer-status { display: flex; align-items: center; gap: 6px; color: #606266; font-size: 13px; }
+  .status-chip { border: 1px solid #dcdfe6; background: #fff; border-radius: 3px; padding: 6px 12px; color: #606266; font-size: 13px; cursor: default; }
+  .status-chip i { color: #1c61fc; font-style: normal; margin-right: 4px; }
+  .footer-btns { display: flex; align-items: center; gap: 6px; }
+  .footer-btns .el-button { height: 32px; }
+  .el-button--text { border: none; background: transparent; color: #1c61fc; padding: 0 12px; height: 32px; cursor: pointer; font-size: 13px; }
+  .el-button--text:hover { color: #1854db; text-decoration: underline; }
+
+  /* ===== 弹窗 ===== */
+  .modal-mask { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 200; justify-content: center; align-items: center; }
+  .modal-mask.show { display: flex; }
+  .modal { background: #fff; border-radius: 6px; width: 440px; padding: 20px 22px; box-shadow: 0 8px 24px rgba(0,0,0,.18); }
+  .modal h3 { margin-bottom: 14px; font-size: 16px; color: #303133; }
+  .modal p { color: #606266; font-size: 13px; margin-bottom: 20px; }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+  .task-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .task-label { font-size: 12px; color: #606266; width: 96px; text-align: right; }
+  .task-input { flex: 1; padding: 6px 8px; border: 1px solid #dcdfe6; border-radius: 4px; font-size: 12px; }
+  .dropdown { display: none; border: 1px solid #dcdfe6; border-radius: 4px; margin: 0 0 8px 104px; background: #fff; max-height: 160px; overflow: auto; }
+  .dropdown.open { display: block; }
+  .dropdown-item { padding: 6px 10px; font-size: 12px; cursor: pointer; color: #303133; }
+  .dropdown-item:hover { background: #ecf5ff; }
+  .result-toast { display: none; position: fixed; left: 50%; top: 90px; transform: translateX(-50%); padding: 12px 24px; border-radius: 4px; font-size: 14px; z-index: 300; background: #f0f9eb; color: #67c23a; border: 1px solid #c2e7b0; box-shadow: 0 4px 14px rgba(0,0,0,.12); }
+  .result-toast.show { display: block; }
+  .result-toast.error { background: #fef0f0; color: #f56c6c; border-color: #fbc4c4; }
+</style>
+</head>
+<body>
+
+<div class="app-header">
+  <div class="logo"><span class="brand">PICC</span><span>车险理赔系统 · 报价处理</span></div>
+  <div class="user">理赔员：王磊</div>
+</div>
+<div class="breadcrumb">
+  <a href="index.html">首页</a> / 报价处理 / <span id="claim-no-display">RDZA2026110000501913</span>
+</div>
+
+<div class="page">
+  <!-- 报案信息 -->
+  <div class="picc-box">
+    <div class="box-head"><span class="head-left">案件信息</span><span style="font-size:12px;color:#909399">报案号：<span id="claim-no" class="text-blue">RDZA2026110000501913</span></span></div>
+    <div class="box-body info-grid">
+      <div class="info-item"><label>报案号</label><span id="claim-no-2">RDZA2026110000501913</span></div>
+      <div class="info-item"><label>报案人</label><span>张婧春</span></div>
+      <div class="info-item"><label>报案人电话</label><span>133****7925</span></div>
+      <div class="info-item"><label>客户等级</label><span>黄金(分)</span></div>
+      <div class="info-item"><label>车牌号码</label><span>京HKX169</span></div>
+      <div class="info-item"><label>车架号(VIN)</label><span id="vin-display" class="text-blue">LSVAU2180N2114297</span></div>
+      <div class="info-item"><label>发动机号</label><span>C495959</span></div>
+      <div class="info-item"><label>车型名称</label><span>理想LXA6493HEV01插电式混合动力多用途乘用车</span></div>
+      <div class="info-item"><label>报案时间</label><span>2026-11-01 09:20:18</span></div>
+      <div class="info-item"><label>出险时间</label><span>2026-10-31 18:40:00</span></div>
+      <div class="info-item"><label>出险地点</label><span>北京市朝阳区建国路88号</span></div>
+      <div class="info-item"><label>出险原因</label><span>碰撞</span></div>
+    </div>
+  </div>
+
+  <!-- 车辆信息 -->
+  <div class="picc-box">
+    <div class="box-head"><span class="head-left">车辆信息</span></div>
+    <div class="box-body info-grid">
+      <div class="info-item"><label>损失方标志</label><span>第三者车辆损失</span></div>
+      <div class="info-item"><label>车辆损失类别</label><span>非全损</span></div>
+      <div class="info-item"><label>车牌号</label><span>京HKX169</span></div>
+      <div class="info-item"><label>车辆种类</label><span>小型汽车</span></div>
+      <div class="info-item"><label>品牌型号</label><span>理想牌 LXA6493HEV01</span></div>
+      <div class="info-item"><label>使用性质</label><span>家庭自用</span></div>
+      <div class="info-item"><label>初次登记日期</label><span>2021-06-18</span></div>
+      <div class="info-item"><label>座位数</label><span>6</span></div>
+    </div>
+  </div>
+
+  <!-- 定损单金额 -->
+  <div class="picc-box">
+    <div class="box-head"><span class="head-left">定损单信息</span></div>
+    <div class="box-body">
+      <table class="data-table">
+        <thead>
+          <tr><th style="width:180px">项目</th><th style="width:220px">金额</th><th style="width:180px">项目</th><th>金额</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>定损单号</td><td class="text-blue">DZ2026110000501913</td><td>定损金额</td><td id="quote-amount" class="text-danger">¥0.00</td></tr>
+          <tr><td>零部件更换费用</td><td class="num">¥0.00</td><td>维修工时费用</td><td class="num">¥0.00</td></tr>
+          <tr><td>辅料费用</td><td class="num">¥0.00</td><td>残值金额</td><td class="num">¥0.00</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 维修项目费用清单（长内容，把编辑按钮推到首屏之外） -->
+  <div class="picc-box">
+    <div class="box-head"><span class="head-left">维修项目费用清单</span></div>
+    <div class="box-body" style="padding:0">
+      <table class="data-table">
+        <thead>
+          <tr><th>序号</th><th>维修项目</th><th>作业方式</th><th>工时</th><th>单价(元)</th><th>金额(元)</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1</td><td>前保险杠拆装</td><td>拆装</td><td>2.5</td><td>120.00</td><td class="num">300.00</td></tr>
+          <tr><td>2</td><td>前保险杠修复</td><td>钣金</td><td>4.0</td><td>150.00</td><td class="num">600.00</td></tr>
+          <tr><td>3</td><td>右前翼子板拆装</td><td>拆装</td><td>2.0</td><td>120.00</td><td class="num">240.00</td></tr>
+          <tr><td>4</td><td>右前翼子板修复</td><td>钣金</td><td>5.0</td><td>150.00</td><td class="num">750.00</td></tr>
+          <tr><td>5</td><td>前机盖修复</td><td>钣金</td><td>6.0</td><td>150.00</td><td class="num">900.00</td></tr>
+          <tr><td>6</td><td>前机盖喷漆</td><td>喷漆</td><td>4.0</td><td>180.00</td><td class="num">720.00</td></tr>
+          <tr><td>7</td><td>前保险杠喷漆</td><td>喷漆</td><td>3.0</td><td>180.00</td><td class="num">540.00</td></tr>
+          <tr><td>8</td><td>右前翼子板喷漆</td><td>喷漆</td><td>3.0</td><td>180.00</td><td class="num">540.00</td></tr>
+          <tr><td>9</td><td>右前门喷漆</td><td>喷漆</td><td>3.0</td><td>180.00</td><td class="num">540.00</td></tr>
+          <tr><td>10</td><td>右后门喷漆</td><td>喷漆</td><td>3.0</td><td>180.00</td><td class="num">540.00</td></tr>
+          <tr><td>11</td><td>前挡风玻璃更换</td><td>更换</td><td>2.0</td><td>200.00</td><td class="num">400.00</td></tr>
+          <tr><td>12</td><td>右前大灯拆装</td><td>拆装</td><td>1.5</td><td>120.00</td><td class="num">180.00</td></tr>
+          <tr><td>13</td><td>右前大灯抛光</td><td>抛光</td><td>2.0</td><td>100.00</td><td class="num">200.00</td></tr>
+          <tr><td>14</td><td>发动机舱清洗</td><td>清洗</td><td>1.0</td><td>80.00</td><td class="num">80.00</td></tr>
+          <tr><td>15</td><td>四轮定位</td><td>定位</td><td>2.0</td><td>150.00</td><td class="num">300.00</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 零部件更换费用清单 -->
+  <div class="picc-box">
+    <div class="box-head"><span class="head-left">零部件更换费用清单</span><span style="font-size:12px;color:#909399">共 3 项</span></div>
+    <div class="box-body" style="padding:0 16px 16px">
+      <div class="el-tabs">
+        <div class="el-tab active">零部件更换费用清单</div>
+        <div class="el-tab">修理项目费用清单</div>
+        <div class="el-tab">辅料费用清单</div>
+        <div class="el-tab">特殊任务</div>
+      </div>
+      <div class="parts-scroll">
+        <table class="data-table" id="parts-table">
+          <thead>
+            <tr><th>序号</th><th>零件编码</th><th>零件名称</th><th>数量</th><th>价格类型</th><th>价格</th><th>状态</th></tr>
+          </thead>
+          <tbody id="parts-tbody">
+            <tr><td>1</td><td>A 285 035 291</td><td>前挡风玻璃（镀膜）</td><td>1</td><td>本地价</td><td>¥1,398.00</td><td>待核价</td></tr>
+            <tr><td>2</td><td>A 251 420 00 49</td><td>右侧围后段支架</td><td>1</td><td>本地价</td><td>¥580.00</td><td>待核价</td></tr>
+            <tr><td>3</td><td>A 251 885 31 03</td><td>右前叶子板内衬</td><td>1</td><td>本地价</td><td>¥782.00</td><td>待核价</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="edit-row">
+        <div id="editButtons">
+          <button class="el-button el-button--primary el-button--mini" id="open-loss-edit"><span> 编辑 </span></button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 报价意见 -->
+  <div class="picc-box" id="quote-opinion-section">
+    <div class="box-head"><span class="head-left">报价意见</span></div>
+    <div class="box-body">
+      <div class="quote-option">
+        <label><input type="radio" name="biz-action" value="quote-done" checked> 报价完成</label>
+        <label><input type="radio" name="biz-action" value="submit-superior"> 提交上级</label>
+        <label><input type="radio" name="biz-action" value="reject"> 驳回</label>
+        <label><input type="radio" name="biz-action" value="transfer"> 转核价岗</label>
+      </div>
+      <div>
+        <label class="form-tip">意见说明</label>
+        <select id="quote-opinion-select" style="width:100%">
+          <option value="">请选择意见</option>
+          <option value="superior-opinion">权限不够，报上级审核</option>
+          <option value="other">其它</option>
+        </select>
+        <textarea id="quote-opinion-input" placeholder="请输入报价意见说明..." style="margin-top:8px"></textarea>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 固定底部操作条：左侧状态栏，右侧 返回 / 暂存 / 提交 -->
+<div class="app-footer picc-bottom-bar buttonClass">
+  <div class="footer-status left-info">
+    <span class="status-chip"><i>▾</i>1/7-当前任务为【定报核】流程!</span>
+  </div>
+  <div class="footer-btns right-link-button">
+    <button class="el-button el-button--text" id="quote-back-btn" onclick="history.back()"><span>返回(F)</span></button>
+    <button class="el-button el-button--text" id="quote-save-btn" onclick="showToast('已暂存当前报价信息')"><span>暂存(S)</span></button>
+    <button class="el-button el-button--text el-button--primary" id="submit-quote-btn"><span>提交(D)</span></button>
+  </div>
+</div>
+
+<!-- 报价提交对话框 -->
+<div class="modal-mask" id="quote-submit-modal">
+  <div class="modal">
+    <h3>报价任务提交</h3>
+    <p>确认提交当前报价任务吗？提交后将进入下一处理环节。</p>
+    <div class="modal-actions">
+      <button class="el-button" onclick="hideModal('quote-submit-modal')"><span>取消</span></button>
+      <button class="el-button el-button--primary" id="confirm-quote-submit"><span>提交任务</span></button>
+    </div>
+  </div>
+</div>
+
+<!-- 提交上级 → 报价任务提交（选择提交路径 + 组别代码） -->
+<div class="modal-mask" id="quote-task-dialog">
+  <div class="modal" style="width:540px">
+    <h3>报价任务提交</h3>
+    <div class="task-row">
+      <span class="task-label">当前任务环节</span>
+      <input class="task-input" value="一级报价" readonly>
+      <span class="task-label">提交路径选择</span>
+      <input class="task-input" id="task-path-input" placeholder="请选择提交路径" autocomplete="off">
+    </div>
+    <div class="dropdown" id="task-path-options">
+      <div class="dropdown-item">一级报价</div>
+      <div class="dropdown-item">九级报价</div>
+    </div>
+    <div class="task-row">
+      <span class="task-label">组别代码</span>
+      <input class="task-input" id="task-group-input" placeholder="组别代码" autocomplete="off">
+      <span class="task-label">人员代码</span>
+      <input class="task-input" id="task-staff-input" placeholder="员工代码或名称" autocomplete="off">
+    </div>
+    <div class="dropdown" id="task-group-options">
+      <div class="dropdown-item">110000000004290-市公司报价组（废弃）</div>
+      <div class="dropdown-item">1100000000005175-市公司报价组</div>
+    </div>
+    <p style="color:#f56c6c;font-size:12px;margin:10px 0 16px">
+      注意：当选择"处理组"为任务自动分配时，处理人员填写框只读，直接提交任务即可！
+    </p>
+    <div class="modal-actions">
+      <button class="el-button" onclick="hideModal('quote-task-dialog')"><span>取消任务处理</span></button>
+      <button class="el-button el-button--primary" id="quote-task-submit"><span>提交任务</span></button>
+    </div>
+  </div>
+</div>
+
+<!-- 提交结果提示 -->
+<div class="result-toast" id="quote-toast"></div>
+
+<script>
+  // 解析查询参数
+  const params = new URLSearchParams(location.search);
+  const claimNo = params.get('claim') || 'RDZA2026110000501913';
+  document.getElementById('claim-no').textContent = claimNo;
+  document.getElementById('claim-no-2').textContent = claimNo;
+  document.getElementById('claim-no-display').textContent = claimNo;
+
+  // ====== 案件数据（金额 / 零部件）======
+  // > 40000 的案件：提交「报价完成」会提示权限不足，必须先「提交上级 + 平级移交回自己」
+  const CASE_DATA = {
+    'RDZA2026110000502491': {
+      amount: 56180,
+      parts: [
+        ['A 251 671 01 00', '前挡风玻璃（镀膜）', 13980],
+        ['A 251 820 01 61', '右前大灯',           12500],
+        ['A 251 880 06 00', '前保险杠',           8700],
+        ['A 251 880 07 00', '右前翼子板',         7800],
+        ['A 251 880 08 00', '左前翼子板',         7800],
+        ['A 251 881 01 00', '前机盖',             5400],
+      ],
+    },
+  };
+  const DEFAULT_CASE = {
+    amount: 2760,
+    parts: [
+      ['A 285 035 291',    '前挡风玻璃（镀膜）', 1398],
+      ['A 251 420 00 49',  '右侧围后段支架',     580],
+      ['A 251 885 31 03',  '右前叶子板内衬',     782],
+    ],
+  };
+  const CASE = CASE_DATA[claimNo] || DEFAULT_CASE;
+  const totalAmount = CASE.amount;
+
+  document.getElementById('quote-amount').textContent =
+    '¥' + totalAmount.toLocaleString('zh-CN', { minimumFractionDigits: 2 });
+
+  // 渲染零部件清单
+  const partsTbody = document.getElementById('parts-tbody');
+  partsTbody.innerHTML = '';
+  CASE.parts.forEach(([code, name, price], i) => {
+    partsTbody.insertAdjacentHTML('beforeend', `
+      <tr><td>${i + 1}</td><td>${code}</td><td>${name}</td><td>1</td><td>本地价</td>
+      <td>¥${price.toLocaleString('zh-CN', { minimumFractionDigits: 2 })}</td>
+      <td>待核价</td></tr>
+    `);
+  });
+
+  function showToast(text, isError) {
+    const toast = document.getElementById('quote-toast');
+    toast.textContent = text;
+    toast.className = 'result-toast show' + (isError ? ' error' : '');
+  }
+
+  // 点击"编辑"打开定损平台
+  document.getElementById('open-loss-edit').addEventListener('click', () => {
+    window.open('loss_assessment.html?claim=' + claimNo, '_blank');
+  });
+
+  // 报价提交流程
+  document.getElementById('submit-quote-btn').addEventListener('click', () => {
+    showModal('quote-submit-modal');
+  });
+  document.getElementById('confirm-quote-submit').addEventListener('click', doSubmitQuote);
+
+  function doSubmitQuote() {
+    hideModal('quote-submit-modal');
+    const actionEl = document.querySelector("input[name='biz-action']:checked");
+    const action = actionEl ? actionEl.value : 'quote-done';
+
+    if (action === 'submit-superior') {
+      // 任务转出：先弹「报价任务提交」选择提交路径 + 组别代码
+      showModal('quote-task-dialog');
+      return;
+    }
+
+    if (action === 'quote-done') {
+      const unlocked = localStorage.getItem('claim_level_up_' + claimNo) === '1';
+      if (totalAmount > 40000 && !unlocked) {
+        // 真实站点：超出权限，提交失败
+        showToast('权限不够，报上级审核（该案件金额超出当前处理权限）', true);
+        return;
+      }
+      localStorage.setItem('claim_done_' + claimNo, '1');
+      showToast('报价任务已成功提交');
+      return;
+    }
+
+    showToast('报价任务已提交（' + action + '）');
+  }
+
+  // ===== 报价任务提交弹窗：提交路径 / 组别代码 下拉 =====
+  const pathInput = document.getElementById('task-path-input');
+  const groupInput = document.getElementById('task-group-input');
+  const pathBox = document.getElementById('task-path-options');
+  const groupBox = document.getElementById('task-group-options');
+
+  function bindDropdown(input, box, onPick) {
+    const items = () => [...box.querySelectorAll('.dropdown-item')];
+    input.addEventListener('focus', () => box.classList.add('open'));
+    input.addEventListener('input', () => {
+      const q = input.value.trim().toLowerCase();
+      box.classList.add('open');
+      items().forEach(item => {
+        item.style.display = (!q || item.textContent.toLowerCase().includes(q)) ? '' : 'none';
+      });
+    });
+    items().forEach(item => {
+      item.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        input.value = item.textContent.trim();
+        box.classList.remove('open');
+        items().forEach(i => i.style.display = '');
+        if (onPick) onPick(item.textContent.trim());
+      });
+    });
+  }
+  // 组别代码选中后 → 人员代码变只读（处理组自动分配）
+  bindDropdown(groupInput, groupBox, (val) => {
+    const staff = document.getElementById('task-staff-input');
+    if (val.includes('5175') && !val.includes('废弃')) {
+      staff.setAttribute('readonly', 'readonly');
+      staff.style.background = '#f5f5f5';
+    }
+  });
+  bindDropdown(pathInput, pathBox);
+
+  document.getElementById('quote-task-submit').addEventListener('click', () => {
+    const path = pathInput.value.trim();
+    const group = groupInput.value.trim();
+    if (path !== '九级报价') {
+      showToast('请选择提交路径「九级报价」', true);
+      return;
+    }
+    if (!group.includes('5175') || group.includes('废弃')) {
+      showToast('组别代码不正确：请选择「1100000000005175-市公司报价组」', true);
+      return;
+    }
+    hideModal('quote-task-dialog');
+    localStorage.setItem('claim_superior_' + claimNo, '1');
+    showToast('工作流转交成功：任务已提交至上级');
+  });
+
+  function showModal(id) { document.getElementById(id).classList.add('show'); }
+  function hideModal(id) { document.getElementById(id).classList.remove('show'); }
+</script>
+</body>
+</html>

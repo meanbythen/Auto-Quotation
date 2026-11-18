@@ -1,0 +1,29 @@
+# ===== 运行数据与日志（不入库）=====
+data/
+logs/
+*.log
+
+# ===== 浏览器持久化登录态（含 Cookie/凭据，绝不入库）=====
+bot/chrome_bot_profile/
+bot/portal_profile/
+
+# ===== 构建产物 =====
+build/
+dist/
+*.exe
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# ===== 文档/证据/截图（体积大，按约定不入库）=====
+docs/
+.screenshots/
+.trae-html-share-packages/
+
+# ===== 本地临时文件 =====
+build_log.txt
+*.tmp

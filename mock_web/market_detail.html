@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>一车一件查询 · 明觉科技 - 配件详情</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Microsoft YaHei", Arial, sans-serif; background: #f4f5f7; color: #333; }
+
+  .top-bar { background: #2b2b2b; color: #fff; padding: 10px 32px; display: flex; align-items: center; justify-content: space-between; }
+  .top-bar .brand { font-size: 16px; font-weight: bold; display: flex; align-items: center; gap: 8px; }
+  .top-bar .brand .logo-text { color: #e8a020; }
+  .top-bar nav a { color: #bbb; text-decoration: none; margin-left: 24px; font-size: 13px; }
+  .top-bar nav a:hover { color: #fff; }
+
+  /* 车辆信息卡 */
+  .car-header {
+    background: linear-gradient(135deg, #2e7d32, #4caf50);
+    color: #fff; padding: 20px 32px;
+    display: flex; gap: 40px; align-items: center;
+  }
+  .car-header .vin-box { background: rgba(255,255,255,.15); padding: 14px 24px; border-radius: 6px; }
+  .car-header .vin-box label { font-size: 12px; opacity: .8; display: block; }
+  .car-header .vin-box b { font-size: 22px; font-family: Consolas, monospace; letter-spacing: 1px; }
+  .car-header .car-info { display: flex; gap: 24px; flex-wrap: wrap; }
+  .car-header .car-info div label { font-size: 11px; opacity: .7; display: block; }
+  .car-header .car-info div span { font-size: 14px; font-weight: bold; }
+
+  .container { padding: 24px 32px; max-width: 1400px; margin: 0 auto; }
+
+  /* 零件查询搜索条 */
+  .part-search { background: #fff; border-radius: 6px; padding: 20px 24px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.05); }
+  .part-search-row { display: flex; gap: 12px; align-items: center; }
+  .part-search-row label { width: 120px; color: #666; font-size: 14px; text-align: right; }
+  .part-search-row input { flex: 1; padding: 12px 14px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }
+  .part-search-row input:focus { outline: none; border-color: #4caf50; }
+  .btn-green { background: #4caf50; color: #fff; border: none; padding: 12px 32px; border-radius: 4px; font-size: 14px; cursor: pointer; font-weight: bold; }
+  .btn-green:hover { background: #388e3c; }
+  .btn-default { background: #fff; color: #666; border: 1px solid #ddd; padding: 12px 20px; border-radius: 4px; font-size: 14px; cursor: pointer; }
+
+  .common-tags { display: flex; gap: 8px; flex-wrap: wrap; padding: 14px 0 0 132px; }
+  .common-tags .tag { padding: 4px 12px; background: #f0f0f0; border-radius: 12px; font-size: 12px; color: #666; cursor: pointer; }
+  .common-tags .tag:hover { background: #e0e0e0; }
+
+  /* 查询结果 */
+  .result-card { background: #fff; border-radius: 6px; padding: 16px 24px; box-shadow: 0 1px 3px rgba(0,0,0,.05); }
+  .result-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; border-bottom: 1px solid #eee; padding-bottom: 12px; }
+  .result-header h3 { font-size: 15px; color: #333; }
+  .result-header .stats { font-size: 12px; color: #888; }
+
+  table.result-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.result-table th { background: #f8f9fa; padding: 12px 10px; text-align: left; border-bottom: 2px solid #e0e0e0; color: #555; font-weight: bold; white-space: nowrap; }
+  table.result-table td { padding: 12px 10px; border-bottom: 1px solid #f0f0f0; }
+  table.result-table tr:hover { background: #f8faff; }
+  .market-price-cell { color: #2e7d32; font-weight: bold; font-size: 16px; }
+  .copy-btn { background: #fff; border: 1px solid #ddd; padding: 3px 8px; border-radius: 3px; font-size: 11px; cursor: pointer; margin-right: 4px; }
+  .copy-btn:hover { background: #f5f5f5; }
+  .exact-row { background: #fffde7; }
+  .exact-row td:first-child::before { content: '⭐'; margin-right: 4px; }
+
+  .empty-state { text-align: center; padding: 40px; color: #999; font-size: 14px; }
+</style>
+</head>
+<body>
+
+<div class="top-bar">
+  <div class="brand"><span class="logo-text">明觉科技</span><span>DATA.ENLIGHTEN</span></div>
+  <nav>
+    <a href="market_home.html">配件查询</a>
+    <a href="#">参数配置</a>
+    <a href="#">极速控价</a>
+  </nav>
+</div>
+
+<!-- 车辆信息头部 -->
+<div class="car-header">
+  <div class="vin-box">
+    <label>当前查询 VIN（车架号）</label>
+    <b id="current-vin">未查询</b>
+  </div>
+  <div class="car-info" id="car-info-grid">
+    <div><label>车辆品牌</label><span id="ci-brand">-</span></div>
+    <div><label>车系</label><span id="ci-series">-</span></div>
+    <div><label>年款</label><span id="ci-year">-</span></div>
+    <div><label>排量</label><span id="ci-eng">-</span></div>
+    <div><label>变速箱</label><span id="ci-trans">-</span></div>
+    <div><label>车型</label><span id="ci-model">-</span></div>
+  </div>
+</div>
+
+<div class="container">
+
+  <!-- 返回首页链接 -->
+  <div style="margin-bottom:12px">
+    <a href="market_home.html" style="color:#666;text-decoration:none;font-size:13px">← 重新查询 VIN</a>
+  </div>
+
+  <!-- 零件编码查询条 -->
+  <div class="part-search">
+    <div class="part-search-row">
+      <label>🔧 零件编码</label>
+      <input type="text" id="part-input" placeholder="输入原厂零件编码（如 A 251 885 03 29）查询市场价" autocomplete="off">
+      <button class="btn-green" id="part-search-btn">查询零件</button>
+      <button class="btn-default" onclick="document.getElementById('part-input').value=''; clearResults()">清空</button>
+    </div>
+    <div class="common-tags">
+      <span class="tag" onclick="quickFill('前挡风玻璃')">前挡风玻璃</span>
+      <span class="tag" onclick="quickFill('大灯')">大灯</span>
+      <span class="tag" onclick="quickFill('前保险杠')">前保险杠</span>
+      <span class="tag" onclick="quickFill('叶子板')">叶子板</span>
+      <span class="tag" onclick="quickFill('机盖')">机盖</span>
+      <span class="tag" onclick="quickFill('车门')">车门</span>
+      <span class="tag" onclick="quickFill('仪表台')">仪表台</span>
+    </div>
+  </div>
+
+  <!-- 查询结果 -->
+  <div class="result-card">
+    <div class="result-header">
+      <h3>🔍 配件查询结果 <span id="result-count" style="font-size:12px;color:#999"></span></h3>
+      <div class="stats" id="result-stats"></div>
+    </div>
+    <table class="result-table">
+      <thead>
+        <tr>
+          <th>图中编号</th>
+          <th>标准名</th>
+          <th>原厂名</th>
+          <th>品牌/OE</th>
+          <th>副厂价(元)</th>
+          <th>4S店价(元)</th>
+          <th>💚 市场参考价(元)</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="result-tbody">
+        <tr><td colspan="8" class="empty-state">请输入零件编码开始查询</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+</div>
+
+<script>
+// ====== VIN -> 车辆信息（模拟数据库） ======
+const VIN_DB = {
+  'WDCCB5EE5DA158563': { brand: '梅赛德斯-奔驰', series: 'R级', year: '2010款', eng: '3.0L V6', trans: '手自一体 7档', model: 'R300L 商务版' },
+  'LSVAU2180N2114297': { brand: '理想', series: 'LXA6493HEV01', year: '2021', eng: '增程式混动', trans: '单速变速箱', model: '理想ONE' },
+  'LC0CE4CB9M0029320': { brand: '比亚迪', series: '元', year: '2021', eng: '纯电动', trans: 'AT(电动车)', model: '比亚迪元 EV' },
+};
+
+// ====== 零件编码 -> 市场价（覆盖定损平台常见编码） ======
+// ====== 零件编码 -> 市场价（来自真实定损截图 WDCCB5EE5DA158563） ======
+// marketPrice = 一车一件真实外网查询到的"市场参考价"，此处用定损平台"定价"列作为模拟值
+const PART_DB = {
+  'A 251 835 01 40': { stdName: '雨刮清洗器储液盖',   oeName: '雨刮清洗器储液盖',   brand: '梅赛德斯-奔驰', oemPrice: 420,  subFactoryPrice: 180, marketPrice: 315 },
+  'A 166 885 31 23': { stdName: '雨刮室空气压缩机',   oeName: '雨刮室空气压缩机',   brand: '梅赛德斯-奔驰', oemPrice: 2500, subFactoryPrice: 850, marketPrice: 1984 },
+  'A 251 880 00 95': { stdName: '右前翼子板',         oeName: '右前翼子板',         brand: '梅赛德斯-奔驰', oemPrice: 8500, subFactoryPrice: 2800,marketPrice: 7032 },
+  'A 251 885 08 06': { stdName: '右前翼子板内衬板',   oeName: '右前翼子板内衬板',   brand: '梅赛德斯-奔驰', oemPrice: 1700, subFactoryPrice: 580, marketPrice: 1352 },
+  'A 251 885 00 99': { stdName: '前保险杠',           oeName: '前保险杠',           brand: '梅赛德斯-奔驰', oemPrice: 9500, subFactoryPrice: 3200,marketPrice: 7824 },
+  'A 251 885 47 90': { stdName: '前保险杠红外装置',   oeName: '前保险杠红外装置',   brand: '梅赛德斯-奔驰', oemPrice: 2300, subFactoryPrice: 780, marketPrice: 1894 },
+  'A 251 862 88 04': { stdName: '右前大灯水喷装置',   oeName: '右前大灯水喷装置',   brand: '梅赛德斯-奔驰', oemPrice: 620,  subFactoryPrice: 220, marketPrice: 560 },
+  'A 251 420 24 02': { stdName: '右前内圈传动器',     oeName: '右前内圈传动器',     brand: '梅赛德斯-奔驰', oemPrice: 950,  subFactoryPrice: 320, marketPrice: 875 },   // ← 市场价 > 本地价(870)，唯一合规件
+  'A 251 420 26 02': { stdName: '右前外侧内圈',       oeName: '右前外侧内圈',       brand: '梅赛德斯-奔驰', oemPrice: 1050, subFactoryPrice: 360, marketPrice: 876 },
+  'A 251 420 28 02': { stdName: '右前中央内圈',       oeName: '右前中央内圈',       brand: '梅赛德斯-奔驰', oemPrice: 1050, subFactoryPrice: 360, marketPrice: 876 },
+  // 高额案件（金额 > 40000）用件：本地价 = 市场价，命中后无需修复
+  'A 251 671 01 00': { stdName: '前挡风玻璃（镀膜）', oeName: '前挡风玻璃（镀膜）', brand: '梅赛德斯-奔驰', oemPrice: 15980, subFactoryPrice: 6800, marketPrice: 13980 },
+  'A 251 820 01 61': { stdName: '右前大灯',           oeName: '右前大灯',           brand: '梅赛德斯-奔驰', oemPrice: 14800, subFactoryPrice: 6200, marketPrice: 12500 },
+  'A 251 880 06 00': { stdName: '前保险杠',           oeName: '前保险杠',           brand: '梅赛德斯-奔驰', oemPrice: 9800,  subFactoryPrice: 3600, marketPrice: 8700 },
+  'A 251 880 07 00': { stdName: '右前翼子板',         oeName: '右前翼子板',         brand: '梅赛德斯-奔驰', oemPrice: 8900,  subFactoryPrice: 3200, marketPrice: 7800 },
+  'A 251 880 08 00': { stdName: '左前翼子板',         oeName: '左前翼子板',         brand: '梅赛德斯-奔驰', oemPrice: 8900,  subFactoryPrice: 3200, marketPrice: 7800 },
+  'A 251 881 01 00': { stdName: '前机盖',             oeName: '前机盖',             brand: '梅赛德斯-奔驰', oemPrice: 6200,  subFactoryPrice: 2200, marketPrice: 5400 },
+};
+
+// ====== 初始化 ======
+const params = new URLSearchParams(location.search);
+const vin = (params.get('vin') || '').toUpperCase();
+
+if (vin) {
+  document.getElementById('current-vin').textContent = vin;
+  const info = VIN_DB[vin] || { brand: '未知品牌', series: '-', year: '-', eng: '-', trans: '-', model: '未匹配到车辆信息' };
+  document.getElementById('ci-brand').textContent = info.brand;
+  document.getElementById('ci-series').textContent = info.series;
+  document.getElementById('ci-year').textContent = info.year;
+  document.getElementById('ci-eng').textContent = info.eng;
+  document.getElementById('ci-trans').textContent = info.trans;
+  document.getElementById('ci-model').textContent = info.model;
+
+  // 零件编码预填（可选）
+  if (params.get('part')) {
+    document.getElementById('part-input').value = params.get('part');
+    setTimeout(searchPart, 600);
+  }
+}
+
+// ====== 零件查询 ======
+document.getElementById('part-search-btn').addEventListener('click', searchPart);
+document.getElementById('part-input').addEventListener('keydown', e => { if (e.key === 'Enter') searchPart(); });
+
+function searchPart() {
+  const code = document.getElementById('part-input').value.trim().toUpperCase();
+  if (!code) { alert('请输入零件编码'); return; }
+
+  const tbody = document.getElementById('result-tbody');
+  tbody.innerHTML = '';
+
+  // 精确匹配优先
+  const exact = PART_DB[code];
+  if (exact) {
+    addResultRow(code, exact, true);
+    document.getElementById('result-count').textContent = '(共 1 个结果)';
+  } else {
+    const codeNoSpace = code.replace(/\s/g, '');
+    let matches = [];
+    for (const [k, v] of Object.entries(PART_DB)) {
+      const kNoSpace = k.replace(/\s/g, '');
+      if (kNoSpace.includes(codeNoSpace) || codeNoSpace.includes(kNoSpace)) {
+        matches.push([k, v]);
+      }
+    }
+    if (matches.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="8" class="empty-state">未找到编码 "${code}" 的配件信息</td></tr>`;
+      document.getElementById('result-count').textContent = '';
+    } else {
+      matches.forEach(([k, v]) => addResultRow(k, v, false));
+      document.getElementById('result-count').textContent = `(共 ${matches.length} 个结果)`;
+    }
+  }
+  updateStats();
+}
+
+function addResultRow(code, info, isExact) {
+  const tbody = document.getElementById('result-tbody');
+  tbody.insertAdjacentHTML('beforeend', `
+    <tr class="${isExact ? 'exact-row' : ''}" data-market-price="${info.marketPrice}" data-part-code="${code}">
+      <td>${Math.floor(Math.random()*80000+10000)}</td>
+      <td>${info.stdName}${isExact ? ' ⭐精准匹配' : ''}</td>
+      <td>${info.oeName}</td>
+      <td>${info.brand}</td>
+      <td>¥${info.subFactoryPrice.toLocaleString()}</td>
+      <td>¥${info.oemPrice.toLocaleString()}</td>
+      <td class="market-price-cell">¥${info.marketPrice.toLocaleString()}</td>
+      <td>
+        <button class="copy-btn" onclick="copyMarketPrice(${info.marketPrice})">📋 复制市场价</button>
+        <button class="copy-btn" onclick="copyPartCode('${code}')">📋 复制编码</button>
+      </td>
+    </tr>
+  `);
+}
+
+function updateStats() {
+  const rows = document.querySelectorAll('#result-tbody tr[data-market-price]');
+  if (rows.length === 0) { document.getElementById('result-stats').textContent = ''; return; }
+  const prices = Array.from(rows).map(r => parseFloat(r.dataset.marketPrice));
+  const avg = Math.round(prices.reduce((a,b)=>a+b,0) / prices.length);
+  const min = Math.min(...prices), max = Math.max(...prices);
+  document.getElementById('result-stats').textContent = `参考价范围 ¥${min} ~ ¥${max}  均价 ¥${avg}`;
+}
+
+function quickFill(name) { document.getElementById('part-input').value = name; searchPart(); }
+function clearResults() {
+  document.getElementById('result-tbody').innerHTML = '<tr><td colspan="8" class="empty-state">请输入零件编码开始查询</td></tr>';
+  document.getElementById('result-count').textContent = '';
+  document.getElementById('result-stats').textContent = '';
+}
+function copyMarketPrice(p) { navigator.clipboard.writeText(String(p)).then(() => alert('市场价已复制: ¥' + p)); }
+function copyPartCode(c) { navigator.clipboard.writeText(c).then(() => alert('编码已复制: ' + c)); }
+</script>
+</body>
+</html>
