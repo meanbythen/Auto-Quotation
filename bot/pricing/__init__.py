@@ -30,8 +30,10 @@ def get_price_service() -> PriceService:
 
         store = PriceStore(app_data_dir() / PRICE_CACHE_DB_NAME,
                            retention_days=PRICE_CACHE_RETENTION_DAYS)
+        # 用户在『数据管理』页保存的有效期优先于 config 默认值
+        stored_days = store.get_valid_days(PRICE_CACHE_VALID_DAYS)
         _SERVICE = PriceService(store,
-                                valid_days=PRICE_CACHE_VALID_DAYS,
+                                valid_days=stored_days,
                                 enabled=PRICE_CACHE_ENABLED)
         try:
             _SERVICE.purge()

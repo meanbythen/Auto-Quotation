@@ -20,6 +20,7 @@ from .base import finalize_record
 async def run_capture(name: str, spec: EnvSpec, *, kind: str = "page",
                       duration_s: int = 600, headless: bool = False,
                       with_mock_compare: bool = False,
+                      snapshot_pages: bool = True,
                       stop_event=None, logger=None) -> RunRecord:
     """kind=page → 页面结构采集；kind=actions → 人工操作录制"""
     setup()
@@ -118,9 +119,11 @@ async def run_capture(name: str, spec: EnvSpec, *, kind: str = "page",
                     context, name,
                     duration_s=duration_s,
                     stop_event=stop_event,
+                    snapshot_pages=snapshot_pages,
                     on_step=lambda s: emit(
                         f"· {getattr(s, 'action', '')} "
-                        f"{(getattr(s, 'selector', '') or '')[:60]}"),
+                        f"{(getattr(s, 'label', '') or '')[:16]} "
+                        f"{(getattr(s, 'selector', '') or '')[:52]}"),
                     meta={"portal": spec.portal, "market": spec.market},
                 )
 
@@ -135,9 +138,11 @@ async def run_capture(name: str, spec: EnvSpec, *, kind: str = "page",
                     "duration_s": res["duration_s"],
                     "workflow": res["workflow"],
                     "markdown": res["markdown"],
+                    "snapshots": [s.get("dir") for s in res.get("snapshots", [])],
                 }
                 emit(f"📂 录制目录: {res['dir']}")
                 emit(f"📄 改进草案: {res['markdown']}")
+                emit(f"🗂 页面快照: {len(res.get('snapshots', []))} 份")
                 status = "done"
 
             else:

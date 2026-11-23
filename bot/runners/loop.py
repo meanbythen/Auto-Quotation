@@ -27,6 +27,7 @@ from bot.envs import EnvSpec, build_environment
 from bot.flows import run_claim_flow, snapshot
 from bot.logging_system import log_error, log_run, setup
 from bot.models import BotRunResult
+from bot.pricing import get_price_service
 from bot.runtime import BotStopped, check_stop, clear_stop, stop_requested
 from bot.step_gate import StepGate
 
@@ -166,12 +167,9 @@ async def _loop_body(env, spec: EnvSpec, *,
                      market_rate_limit: bool = True,
                      market_breaker: bool = True) -> list:
     all_results: list = []
-    processed_set: set = set()          # 已达处理次数上限的报案号
-    processed_counts: dict = {}         # 报案号 -> 已处理次数（首次=1，重复=2）
-    MAX_CLAIM_PASSES = 2               # 同一报案号最多处理 2 次：首次全流程 + 重复时同步/提交
-    # 本进程内已提交过上级的报案号：第二轮/重试时不再重复「提交上级」，
-    # 改为直接试「报价完成」；只有弹『请提交远程操作平台处理』才走分中心报价
-    superior_submitted: set = set()
+    processed_set: set = set()          # 已连续处理到上限的报案号（离开列表后自动解除）
+    processed_counts: dict = {}         # 报案号 -> 连续处理次数
+    MAX_CLAIM_PASSES = 2               # 同一报案号连续出现时最多完整处理 2 次，防止平台异常导致死循环
     failed_attempts: dict = {}
     MAX_OPEN_RETRY = 3
     processed_count = 0
@@ -179,10 +177,17 @@ async def _loop_body(env, spec: EnvSpec, *,
     skipped_list: list[tuple] = []
 
     def _mark_processed(claim_no: str) -> None:
-        """记一次处理；未达上限的报案号留在列表里仍会被再次处理"""
+        """记一次处理；未达上限的报案号留在列表里仍会被再次完整处理"""
         processed_counts[claim_no] = processed_counts.get(claim_no, 0) + 1
         if processed_counts[claim_no] >= MAX_CLAIM_PASSES:
             processed_set.add(claim_no)
+
+    def _forget_absent_claims(pending_claims) -> None:
+        """报案号离开列表后清空计数：以后再次出现时按新任务重新完整处理"""
+        present = set(pending_claims)
+        for done in [c for c in processed_counts if c not in present]:
+            processed_counts.pop(done, None)
+            processed_set.discard(done)
 
     iteration = 0
     while processed_count < max_count:
@@ -214,12 +219,14 @@ async def _loop_body(env, spec: EnvSpec, *,
             continue
 
         pending = await env.portal.list_claims()
+        _forget_absent_claims(pending)
         new_claims = [c for c in pending if c not in processed_set]
 
         if not new_claims:
             print(f"\n  🔄 当前列表没有新任务，刷新页面确认...")
             log_run("列表无新任务 → 刷新确认")
             pending = await _refresh_claims(env)
+            _forget_absent_claims(pending)
             new_claims = [c for c in pending if c not in processed_set]
 
             if new_claims:
@@ -258,27 +265,65 @@ async def _loop_body(env, spec: EnvSpec, *,
                        market_price_threshold=market_price_threshold,
                        market_rate_limit=market_rate_limit,
                        market_breaker=market_breaker)
-        # 同一个报案号第二次从列表里扫出来 → 简化流程：全选同步定损后直接提交，
-        # 不再查一车一件、不再改价（价格首轮已确定）
-        ctx["reprocess"] = processed_counts.get(claim, 0) > 0
-        # 本进程内已提交过上级 → 本轮直接试「报价完成」，不再连着提交上级
-        if claim in superior_submitted:
-            ctx["high_amount_transferred"] = True
-            print(f"  [i] {claim} 已提交过上级 → 本轮直接试『报价完成』，不再重复提交上级")
-            log_run(f"已提交过上级 → 跳过提交上级 | 报案号={claim}")
-        if ctx["reprocess"]:
-            print(f"\n  🔁 {claim} 已处理过 → 本轮按『重复处理』执行（全选同步定损 → 直接提交）")
-            log_run(f"重复处理模式 | 报案号={claim} | 第 {processed_counts.get(claim, 0) + 1} 次")
+        # 同一报案号再次从列表里扫出来 → 仍走完整流程：
+        # 已改过报价的零件由 STEP 7 按『报案号+零件』自动跳过，其余零件照常查询/改价。
+        pass_index = processed_counts.get(claim, 0) + 1
+        if pass_index > 1:
+            print(f"\n  🔁 {claim} 第 {pass_index} 次出现 → 本轮仍执行完整流程"
+                  f"（已改价零件跳过，其余零件照常查询）")
+            log_run(f"重复出现 → 完整流程 | 报案号={claim} | 第 {pass_index} 次")
         route = ""
 
         try:
             route = await run_claim_flow(env, ctx, result, rec=rec)
-            if ctx.get("high_amount_transferred"):
-                superior_submitted.add(claim)
+            try:
+                get_price_service().mark_claim_processed(claim)
+            except Exception:
+                pass
             if result.status == "running":
                 result.status = "done"
 
-            if route == "skip_direct_supply":
+            if route == "skip_part_color":
+                processed_count += 1
+                _mark_processed(claim)
+                all_results.append(result)
+                result.status = "skipped"
+                skipped_count += 1
+                note = result.messages[-1] if result.messages else "零件名称颜色需人工处理"
+                skipped_list.append((claim, "STEP 9", "零件名称颜色需人工处理"))
+                write_ledger(claim, result.vehicle, result.parts,
+                             status="skipped", note=note, skip_step="STEP 9")
+                finalize_record(rec, status="skipped", route=route,
+                                data=snapshot(ctx, result, route))
+                record_skip(claim, "STEP 9", "零件名称颜色需人工处理，STEP 1~8 已完成，未提交报价完成")
+                print(f"\n  ⏭ #{processed_count} {claim} 零件名称颜色需人工处理 "
+                      f"→ STEP 1~8 已完成，STEP 9 前跳过，继续下一个")
+                log_run(f"#{processed_count} {claim} 零件名称颜色需人工处理 → STEP 9 前跳过")
+                if logger:
+                    try:
+                        logger(f"⏭ #{processed_count} {claim} 零件名称颜色需人工处理 → STEP 9 前跳过")
+                    except Exception:
+                        pass
+                await asyncio.sleep(2)
+            elif route == "return_part_color":
+                processed_count += 1
+                _mark_processed(claim)
+                all_results.append(result)
+                note = (result.messages[-1] if result.messages
+                        else "零件名称蓝色/纯橙色 → 已退回")
+                write_ledger(claim, result.vehicle, result.parts,
+                             status="done", note=note)
+                finalize_record(rec, status="done", route=route,
+                                data=snapshot(ctx, result, route))
+                print(f"\n  ↩️ #{processed_count} {claim} 零件名称蓝色/纯橙色 → 已退回")
+                log_run(f"#{processed_count} {claim} 零件名称蓝色/纯橙色 → 退回成功")
+                if logger:
+                    try:
+                        logger(f"↩️ #{processed_count} {claim} 零件名称蓝色/纯橙色 → 已退回")
+                    except Exception:
+                        pass
+                await asyncio.sleep(2)
+            elif route == "skip_direct_supply":
                 processed_count += 1
                 _mark_processed(claim)
                 all_results.append(result)
@@ -328,8 +373,6 @@ async def _loop_body(env, spec: EnvSpec, *,
             break
 
         except Exception as exc:
-            if ctx.get("high_amount_transferred"):
-                superior_submitted.add(claim)
             step = (getattr(StepGate.instance(), "current_step", "") or "").strip() or "未知步骤"
             reason = str(exc).splitlines()[0][:200]
             print(f"\n  ⏭  {claim} 在当前流程处理不了，跳过")
@@ -355,12 +398,15 @@ async def _loop_body(env, spec: EnvSpec, *,
                 await asyncio.sleep(2)
                 continue
 
-            # 高额案件已提交上级并平级移交回本人 → 报案号会重新回到首页列表，
-            # 不能因为“已处理过/重复报案号”就永久跳过，下一轮按新任务重新处理
+            # 高额案件已提交上级，后续步骤失败时先写工作记录再重试；
+            # high_amount_transferred 只代表提交上级成功，不能据此宣称平级移交已成功。
             if ctx.get("high_amount_transferred") and attempt < MAX_OPEN_RETRY:
-                print(f"\n  ↻ {claim} 已提交上级并平级移交回本人 → 下一轮按新任务重新处理"
+                write_ledger(claim, result.vehicle, result.parts, status="skipped",
+                             note=f"高额分支重试：卡在 {step}：{reason}", skip_step=step)
+                print(f"\n  ↻ {claim} 已提交上级，但卡在 {step} → 下一轮按新任务重新处理"
                       f"（第 {attempt} 次，最多 {MAX_OPEN_RETRY} 次）")
-                log_run(f"{claim} 高额分支未完成 → 下轮按新任务重试（第 {attempt} 次）")
+                log_run(f"{claim} 高额分支未完成（卡在 {step}：{reason}）→ "
+                        f"下轮按新任务重试（第 {attempt} 次）")
                 await _close_popup(ctx, env)
                 await asyncio.sleep(2)
                 continue

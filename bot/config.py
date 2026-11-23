@@ -68,6 +68,13 @@ TASK_TRANSFER_URL_ALTS = (
 # ============ 一级报价权限：报价汇总『换件金额』超过该值 → 业务动作『提交上级』 ============
 HIGH_AMOUNT_THRESHOLD = 40000.0
 
+# ============ 定损平台『零件名称』字体颜色规则 ============
+# 橙色带下划线 = 通过标准点选方式添加 → 视同黑色，正常自动处理
+PART_NAME_UNDERLINE_AS_BLACK = True
+# 需要跳过的精确颜色，归一化后如 ("rgb(28,97,252)", "rgb(255,153,0)")
+# 留空 = 使用内置启发式：蓝色、无下划线的橙色 视为需要人工处理的颜色
+PART_NAME_SKIP_COLORS: tuple = ()
+
 # ============ 超出权限补救：平级移交的目标人员（可配置，GUI 输入框覆盖） ============
 TRANSFER_TARGET_DEFAULT = "17247339-胡晨光"
 
@@ -169,7 +176,8 @@ SELECTORS_PORTAL = {
     "quote_task_dialog":         "#quote-task-dialog, .modal[data-modal='quote-task'], .el-dialog:has-text('报价任务提交')",
     "quote_task_path_input":     "#task-path-input, input[name='submitPath'], input[placeholder*='提交路径']",
     "quote_task_path_option":    "#task-path-options, .el-select-dropdown__item, .dropdown-item",
-    "quote_task_group_input":    "#task-group-input, input[name='groupCode'], input[placeholder*='组别代码']",
+    "quote_task_group_input":    ("#task-group-input, input[name='groupCode'], "
+                                  "input[placeholder='组号或组名'], input[placeholder*='组别代码']"),
     "quote_task_group_option":   "#task-group-options, .el-select-dropdown__item, .dropdown-item",
     "quote_task_staff_input":    "#task-staff-input, input[name='staffCode'], input[placeholder*='人员代码']",
     "quote_task_submit_btn":     "#quote-task-submit",
@@ -191,9 +199,16 @@ SELECTORS_PORTAL = {
     "task_transfer_claim_link":   "a, .el-link, span[class*='link']",
     # 任务提交弹窗（v-if 渲染，保存页里是空的）：div.el-dialog__wrapper.taskTransferDom
     "task_transfer_modal":        ".taskTransferDom .el-dialog, .el-dialog[aria-label='任务提交'], .el-dialog:has-text('任务提交')",
-    "task_transfer_target_input": (".taskTransferDom input[placeholder*='人员'], .taskTransferDom input[placeholder*='工号'], "
+    # 生产实测（2026-11-18 录制）：目标人员输入框 placeholder 是『请输入员工代码或名称』，
+    # 目标小组是『请输入组号或组员』——两个都是可编辑 input，
+    # 旧选择器只认『人员/工号/姓名』会匹配不到而落到第一个 input（=目标小组），填错框。
+    "task_transfer_target_input": ("input[placeholder*='员工代码'], input[placeholder*='员工名称'], "
+                                   "input[placeholder*='员工'], "
+                                   ".taskTransferDom input[placeholder*='人员'], "
+                                   ".taskTransferDom input[placeholder*='工号'], "
                                    ".taskTransferDom input[placeholder*='姓名'], "
-                                   "input[name='targetUser'], input[placeholder*='目标人员'], input[placeholder*='人员工号']"),
+                                   "input[name='targetUser'], input[placeholder*='目标人员'], "
+                                   "input[placeholder*='人员工号']"),
     "task_transfer_submit_btn":   (".taskTransferDom button.el-button--primary, .taskTransferDom button:has-text('提交'), "
                                    "#submit-task-btn, button:has-text('提交任务')"),
     "task_transfer_tip":          "#transfer-toast, .toast, .el-message",
@@ -213,7 +228,7 @@ SELECTORS_MARKET_MOCK = {
 # ============ 本地配件价格缓存库 ============
 # 目标：同一 VIN + 零件编码在有效期内只查一次一车一件
 PRICE_CACHE_ENABLED = True          # 总开关（False = 完全回到无缓存行为）
-PRICE_CACHE_VALID_DAYS = 30         # 价格有效期（天），过期强制回源
+PRICE_CACHE_VALID_DAYS = 90         # 价格有效期（天），过期强制回源；可在『数据管理』页修改
 PRICE_CACHE_RETENTION_DAYS = 730    # 过期历史保留天数（用于回溯/趋势）
 PRICE_CACHE_DB_NAME = "price_cache.db"   # 存放于 data/ 目录
 

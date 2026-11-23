@@ -57,7 +57,7 @@ from bot.logging_system import (
     log_system, log_run, log_audit, log_error, log_run_text, log_err_text,
 )
 from bot.version import APP_NAME, version_text, recent_changes, latest
-from bot.config import TRANSFER_TARGET_DEFAULT
+from bot.config import TRANSFER_TARGET_DEFAULT, PRICE_CACHE_VALID_DAYS
 
 # ============== 主题配色常量 ==============
 BG = "#0f1729"
@@ -143,7 +143,7 @@ class _StreamLogRedirector(io.TextIOBase):
 
     @staticmethod
     def _colorize(w, line):
-        if "✅" in line or "🎉" in line or "[✓]" in line:
+        if "✅" in line or "🎉" in line or "[✓]" in line or "💾" in line:
             w.insert("end", line, "success")
         elif "❌" in line or "🚫" in line or "Error" in line or "失败" in line:
             w.insert("end", line, "danger")
@@ -172,6 +172,53 @@ def _safe_state(widget, state: str) -> None:
             widget.configure(state=state)
     except Exception:
         pass
+
+
+def export_parts_xlsx(path: str, rows) -> int:
+    """把零件价格记录写成 Excel（write_only 流式写入，几万行也不吃内存）
+
+    rows 为可迭代的 dict：vin/part_code/part_name/price/source/status/fresh/
+    brand/model/fetched_at/expires_at
+    """
+    from openpyxl import Workbook
+    from openpyxl.cell import WriteOnlyCell
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    from bot.pricing.service import _SOURCE_LABELS
+
+    head = ["VIN", "零件编码", "零件名称", "价格(元)", "来源", "状态",
+            "品牌", "车型", "缓存时间", "到期时间"]
+    widths = [21, 14, 26, 11, 13, 9, 12, 14, 20, 20]
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet("零件价格")
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    head_cells = []
+    for h in head:
+        c = WriteOnlyCell(ws, value=h)
+        c.font = Font(bold=True, color="FFFFFF", name="微软雅黑", size=10)
+        c.fill = PatternFill("solid", fgColor="4472C4")
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        head_cells.append(c)
+    ws.append(head_cells)
+    n = 0
+    for r in rows:
+        ws.append([
+            r.get("vin", ""),
+            r.get("part_code", ""),
+            r.get("part_name", ""),
+            r.get("price"),
+            _SOURCE_LABELS.get(r.get("source", ""), r.get("source", "")),
+            "有效" if r.get("fresh") else "已过期",
+            r.get("brand", ""),
+            r.get("model", ""),
+            (r.get("fetched_at") or "").replace("T", " "),
+            (r.get("expires_at") or "").replace("T", " "),
+        ])
+        n += 1
+    ws.freeze_panes = "A2"
+    wb.save(path)
+    return n
 
 
 class App:
@@ -330,6 +377,7 @@ class App:
             ("diff", "🔍", "🔍 流程比对"),
             ("logs", "📄", "📄 日志中心"),
             ("worklog", "📒", "📒 工作记录"),
+            ("data", "🗄", "🗄 数据管理"),
         ]
         for key, icon, tooltip in items:
             b = tk.Button(sb, text=icon, command=lambda k=key: self._switch_view(k),
@@ -364,6 +412,7 @@ class App:
         elif key == "diff": self._build_diff_view()
         elif key == "logs": self._build_log_view()
         elif key == "worklog": self._build_worklog_view()
+        elif key == "data": self._build_data_view()
         else: self._build_console_view()
 
 
@@ -1221,6 +1270,12 @@ class App:
                        variable=self.capture_cmp_var, bg=BG, fg=TEXT_MUTED,
                        selectcolor=SURFACE, activebackground=BG, activeforeground=TEXT,
                        font=("Segoe UI", 9), bd=0, highlightthickness=0).pack(side="left")
+        self.rec_snap_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(ctrl2, text="录制时保存关键页面快照（弹窗/跳转/下拉 → HTML，供事后读 DOM）",
+                       variable=self.rec_snap_var, bg=BG, fg=TEXT_MUTED,
+                       selectcolor=SURFACE, activebackground=BG, activeforeground=TEXT,
+                       font=("Segoe UI", 9), bd=0, highlightthickness=0).pack(side="left",
+                                                                             padx=(12, 0))
         self._make_btn(ctrl2, "📂 打开采集目录", SURFACE_2, BORDER,
                        self._open_capture_dir).pack(side="left", padx=(12, 0))
 
@@ -1299,8 +1354,10 @@ class App:
             self.root.after(0, lambda l=line: self._append_rec(l))
 
         try:
+            snap = bool(getattr(self, "rec_snap_var", None) and self.rec_snap_var.get())
             asyncio.run(run_capture(self._rec_name, spec, kind="actions",
                                     duration_s=3600, stop_event=self._rec_stop_flag,
+                                    snapshot_pages=snap,
                                     logger=push))
             self.root.after(0, lambda: self._append_rec(
                 "✅ 录制结束 → data/capture（改进草案） 与 data/workflows（流程比对）"))
@@ -1569,6 +1626,351 @@ class App:
         except Exception as exc:
             messagebox.showerror("工作记录", f"打开失败: {exc}")
 
+    # ============== View: 数据管理（本地零件价格库）==============
+    _DATA_COLS = [
+        ("vin", "VIN", 170),
+        ("code", "零件编码", 115),
+        ("name", "零件名称", 170),
+        ("price", "价格(元)", 85),
+        ("source", "来源", 90),
+        ("status", "状态", 70),
+        ("car", "品牌/车型", 130),
+        ("fetched", "缓存时间", 135),
+        ("expires", "到期时间", 135),
+    ]
+
+    def _open_price_store(self):
+        from bot.config import PRICE_CACHE_DB_NAME
+        from bot.logging_system import app_data_dir
+        from bot.pricing import PriceStore
+        return PriceStore(app_data_dir() / PRICE_CACHE_DB_NAME)
+
+    def _build_data_view(self):
+        wrap = tk.Frame(self.content, bg=BG)
+        wrap.pack(fill="both", expand=True, padx=18, pady=(14, 4))
+
+        head = tk.Frame(wrap, bg=BG); head.pack(fill="x")
+        tk.Label(head, text="🗄 数据管理", bg=BG, fg=TEXT,
+                 font=("Segoe UI Semibold", 14)).pack(side="left")
+        tk.Label(head, text="本地零件价格库 · 统计 + 条件查询", bg=BG, fg=TEXT_DIM,
+                 font=("Segoe UI", 9)).pack(side="left", padx=10)
+        db_text = ""
+        try:
+            from bot.config import PRICE_CACHE_DB_NAME
+            from bot.logging_system import app_data_dir
+            db_text = str(app_data_dir() / PRICE_CACHE_DB_NAME)
+        except Exception:
+            pass
+        tk.Label(head, text=db_text, bg=BG, fg=TEXT_DIM,
+                 font=("Consolas", 8)).pack(side="right")
+
+        # ---- 统计卡片 ----
+        stats = tk.Frame(wrap, bg=BG); stats.pack(fill="x", pady=(10, 0))
+        self.data_stat_vars = {}
+        cards = [("vehicles", "🚗 车辆数"), ("prices", "📦 报价记录"),
+                 ("fresh", "✅ 有效"), ("expired", "⏳ 已过期"),
+                 ("hit", "💾 缓存命中"), ("remote", "🌐 远程查询"),
+                 ("rate", "🎯 命中率")]
+        for i, (key, title) in enumerate(cards):
+            card = tk.Frame(stats, bg=SURFACE, highlightthickness=1,
+                            highlightbackground=BORDER)
+            card.grid(row=0, column=i, sticky="ew", padx=(0, 6))
+            stats.columnconfigure(i, weight=1)
+            tk.Label(card, text=title, bg=SURFACE, fg=TEXT_MUTED,
+                     font=("Segoe UI", 9)).pack(anchor="w", padx=10, pady=(6, 0))
+            var = tk.StringVar(value="—")
+            tk.Label(card, textvariable=var, bg=SURFACE, fg=ACCENT,
+                     font=("Segoe UI Semibold", 15)).pack(anchor="w", padx=10, pady=(0, 6))
+            self.data_stat_vars[key] = var
+
+        self.data_src_var = tk.StringVar(value="来源分布：—")
+        tk.Label(wrap, textvariable=self.data_src_var, bg=BG, fg=TEXT_MUTED,
+                 font=("Segoe UI", 9)).pack(anchor="w", pady=(6, 0))
+
+        # ---- 价格有效期（超过则回源更新）----
+        valid_bar = tk.Frame(wrap, bg=BG); valid_bar.pack(fill="x", pady=(6, 0))
+        tk.Label(valid_bar, text="价格有效期", bg=BG, fg=TEXT_MUTED,
+                 font=("Segoe UI", 9)).pack(side="left")
+        try:
+            _s = self._open_price_store()
+            try:
+                _days_now = _s.get_valid_days(PRICE_CACHE_VALID_DAYS)
+            finally:
+                _s.close()
+        except Exception:
+            _days_now = PRICE_CACHE_VALID_DAYS
+        self.data_valid_var = tk.StringVar(value=str(_days_now))
+        valid_entry = tk.Entry(valid_bar, textvariable=self.data_valid_var, width=6,
+                               bg=SURFACE, fg=TEXT, insertbackground=TEXT,
+                               relief="flat", bd=0)
+        valid_entry.pack(side="left", padx=(6, 4), ipady=3)
+        valid_entry.bind("<Return>", lambda _e: self._save_valid_days())
+        tk.Label(valid_bar,
+                 text="天，超过则重新查询外部端口（主机厂通常 90 天更新一次价格）",
+                 bg=BG, fg=TEXT_DIM, font=("Segoe UI", 9)).pack(side="left")
+        self._make_btn(valid_bar, "💾 保存", SURFACE_2, BORDER,
+                       self._save_valid_days).pack(side="left", padx=8)
+        self.data_valid_hint = tk.StringVar(value="")
+        tk.Label(valid_bar, textvariable=self.data_valid_hint, bg=BG, fg=SUCCESS,
+                 font=("Segoe UI", 9)).pack(side="left")
+
+        # ---- 条件查询 ----
+        bar = tk.Frame(wrap, bg=BG); bar.pack(fill="x", pady=(8, 6))
+        self.data_vin_var = tk.StringVar()
+        self.data_code_var = tk.StringVar()
+        self.data_name_var = tk.StringVar()
+        self.data_src_pick = tk.StringVar(value="全部来源")
+        self.data_status_pick = tk.StringVar(value="全部状态")
+
+        def _entry(label, var, width):
+            tk.Label(bar, text=label, bg=BG, fg=TEXT_MUTED,
+                     font=("Segoe UI", 9)).pack(side="left")
+            e = tk.Entry(bar, textvariable=var, width=width, bg=SURFACE, fg=TEXT,
+                         insertbackground=TEXT, relief="flat", bd=0)
+            e.pack(side="left", padx=(4, 10), ipady=4)
+            e.bind("<Return>", lambda _e: self._refresh_data())
+            return e
+
+        _entry("VIN", self.data_vin_var, 20)
+        _entry("零件编码", self.data_code_var, 14)
+        _entry("零件名称", self.data_name_var, 14)
+        self.data_src_combo = ttk.Combobox(bar, textvariable=self.data_src_pick, width=12,
+                                           state="readonly", values=["全部来源"],
+                                           font=("Segoe UI", 9))
+        self.data_src_combo.pack(side="left", padx=(0, 8))
+        ttk.Combobox(bar, textvariable=self.data_status_pick, width=10,
+                     state="readonly", values=["全部状态", "有效", "已过期"],
+                     font=("Segoe UI", 9)).pack(side="left", padx=(0, 10))
+        self._make_btn(bar, "🔎 查询", ACCENT, SURFACE_2,
+                       self._data_query).pack(side="left")
+        self._make_btn(bar, "✖ 重置", SURFACE_2, BORDER,
+                       self._data_reset).pack(side="left", padx=6)
+        self._make_btn(bar, "🔄 刷新", SURFACE_2, BORDER,
+                       self._refresh_data).pack(side="left")
+
+        # ---- 结果表 ----
+        st = ttk.Style()
+        st.configure("DM.Treeview", background=SURFACE, fieldbackground=SURFACE,
+                     foreground=TEXT, rowheight=23, borderwidth=0,
+                     font=("Microsoft YaHei UI", 9))
+        st.configure("DM.Treeview.Heading", background=SURFACE_2, foreground=TEXT_MUTED,
+                     font=("Segoe UI Semibold", 9), relief="flat")
+        st.map("DM.Treeview", background=[("selected", SURFACE_2)],
+               foreground=[("selected", ACCENT)])
+
+        box = tk.Frame(wrap, bg=BG); box.pack(fill="both", expand=True)
+        keys = [c[0] for c in self._DATA_COLS]
+        self.data_tree = ttk.Treeview(box, columns=keys, show="headings",
+                                      style="DM.Treeview", selectmode="browse")
+        for key, title, width in self._DATA_COLS:
+            self.data_tree.heading(key, text=title, anchor="w")
+            self.data_tree.column(key, width=width, minwidth=60, anchor="w", stretch=False)
+        ysb = ttk.Scrollbar(box, orient="vertical", command=self.data_tree.yview)
+        xsb = ttk.Scrollbar(box, orient="horizontal", command=self.data_tree.xview)
+        self.data_tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        self.data_tree.grid(row=0, column=0, sticky="nsew")
+        ysb.grid(row=0, column=1, sticky="ns")
+        xsb.grid(row=1, column=0, sticky="ew")
+        box.rowconfigure(0, weight=1)
+        box.columnconfigure(0, weight=1)
+        self.data_tree.tag_configure("fresh", foreground=SUCCESS)
+        self.data_tree.tag_configure("expired", foreground=WARNING)
+
+        # ---- 分页 / 导出 ----
+        self.data_page = 1
+        self.data_page_size = tk.StringVar(value="500")
+        self.data_page_var = tk.StringVar(value="第 1 / 1 页")
+        foot = tk.Frame(wrap, bg=BG); foot.pack(fill="x", pady=(6, 0))
+        self.data_count_var = tk.StringVar(value="")
+        tk.Label(foot, textvariable=self.data_count_var, bg=BG, fg=TEXT_DIM,
+                 font=("Segoe UI", 9)).pack(side="left")
+        tk.Label(foot, text="每页", bg=BG, fg=TEXT_MUTED,
+                 font=("Segoe UI", 9)).pack(side="left", padx=(12, 4))
+        size_combo = ttk.Combobox(foot, textvariable=self.data_page_size, width=6,
+                                  state="readonly",
+                                  values=["100", "200", "500", "1000", "2000"],
+                                  font=("Segoe UI", 9))
+        size_combo.pack(side="left")
+        size_combo.bind("<<ComboboxSelected>>", lambda _e: self._data_query())
+        self._make_btn(foot, "📤 导出 Excel", SURFACE_2, BORDER,
+                       self._data_export).pack(side="right")
+        self._make_btn(foot, "▶ 下一页", SURFACE_2, BORDER,
+                       self._data_next).pack(side="right", padx=6)
+        tk.Label(foot, textvariable=self.data_page_var, bg=BG, fg=TEXT_MUTED,
+                 font=("Segoe UI", 9)).pack(side="right", padx=4)
+        self._make_btn(foot, "◀ 上一页", SURFACE_2, BORDER,
+                       self._data_prev).pack(side="right")
+
+        self._refresh_data()
+
+    def _data_reset(self):
+        self.data_vin_var.set("")
+        self.data_code_var.set("")
+        self.data_name_var.set("")
+        self.data_src_pick.set("全部来源")
+        self.data_status_pick.set("全部状态")
+        self._data_query()
+
+    def _data_query(self):
+        """查询 / 改每页条数 / 重置 → 回到第 1 页"""
+        self.data_page = 1
+        self._refresh_data()
+
+    def _data_prev(self):
+        if getattr(self, "data_page", 1) > 1:
+            self.data_page -= 1
+            self._refresh_data()
+
+    def _data_next(self):
+        self.data_page = getattr(self, "data_page", 1) + 1
+        self._refresh_data()
+
+    def _data_export(self):
+        """把当前筛选条件下的全部记录导出 Excel（不只当前页）"""
+        from tkinter import filedialog
+        filters = dict(getattr(self, "_data_filters", {}) or {})
+        name = f"零件价格_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title="导出零件价格数据", defaultextension=".xlsx",
+            initialfile=name, filetypes=[("Excel 工作簿", "*.xlsx")])
+        if not path:
+            return
+        self.data_count_var.set("正在导出…")
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
+        store = None
+        try:
+            store = self._open_price_store()
+            n = export_parts_xlsx(path, store.iter_parts(**filters))
+            self.data_count_var.set(f"已导出 {n} 条 → {path}")
+            print(f"  [✓] 数据管理：已导出 {n} 条 → {path}")
+        except Exception as exc:
+            self.data_count_var.set("导出失败")
+            messagebox.showerror("导出失败", f"{exc}", parent=self.root)
+        finally:
+            try:
+                if store is not None:
+                    store.close()
+            except Exception:
+                pass
+
+    def _save_valid_days(self):
+        """保存价格有效期：立即重算已缓存记录的到期时间，挂机循环下次判断即用新值"""
+        raw = (self.data_valid_var.get() or "").strip()
+        try:
+            days = int(raw)
+        except ValueError:
+            messagebox.showwarning("输入有误", "有效期请填写整数天数，例如 90", parent=self.root)
+            return
+        if not 1 <= days <= 3650:
+            messagebox.showwarning("输入有误", "有效期需在 1 ~ 3650 天之间", parent=self.root)
+            return
+        store = None
+        try:
+            store = self._open_price_store()
+            n = store.set_valid_days(days)
+        except Exception as exc:
+            messagebox.showerror("保存失败", f"{exc}", parent=self.root)
+            return
+        finally:
+            try:
+                if store is not None:
+                    store.close()
+            except Exception:
+                pass
+        # 运行中的单例服务立即生效；config 常量同步，供日志展示新值
+        try:
+            from bot.pricing import get_price_service
+            get_price_service().valid_days = days
+        except Exception:
+            pass
+        try:
+            from bot import config as _cfg
+            _cfg.PRICE_CACHE_VALID_DAYS = days
+        except Exception:
+            pass
+        self.data_valid_var.set(str(days))
+        self.data_valid_hint.set(f"已保存：{days} 天，重算 {n} 条历史记录")
+        try:
+            log_audit(f"价格有效期改为 {days} 天（重算 {n} 条历史记录）")
+        except Exception:
+            pass
+        self._refresh_data()
+
+    def _refresh_data(self):
+        from bot.pricing.service import _SOURCE_LABELS
+        if not hasattr(self, "data_tree"):
+            return
+        src_by_label = {"全部来源": ""}
+        status_map = {"全部状态": "", "有效": "fresh", "已过期": "expired"}
+        try:
+            size = max(1, int(self.data_page_size.get() or 500))
+        except Exception:
+            size = 500
+        page = max(1, int(getattr(self, "data_page", 1)))
+        store = None
+        try:
+            store = self._open_price_store()
+            st = store.stats()
+            src_rows = store.source_stats()
+            for code, _cnt in src_rows:
+                src_by_label[_SOURCE_LABELS.get(code, code or "未知")] = code
+            self.data_src_combo["values"] = list(src_by_label.keys())
+            if self.data_src_pick.get() not in src_by_label:
+                self.data_src_pick.set("全部来源")
+            filters = dict(
+                vin=self.data_vin_var.get(),
+                part_code=self.data_code_var.get(),
+                part_name=self.data_name_var.get(),
+                source=src_by_label.get(self.data_src_pick.get(), ""),
+                status=status_map.get(self.data_status_pick.get(), ""))
+            rows, total = store.search_parts(**filters, limit=size,
+                                            offset=(page - 1) * size)
+            pages = max(1, (total + size - 1) // size)
+            if page > pages:      # 翻过头（或筛选后总数变少）→ 落到最后一页
+                page = pages
+                rows, total = store.search_parts(**filters, limit=size,
+                                                 offset=(page - 1) * size)
+        except Exception as exc:
+            print(f"[!] 读取本地价格库失败: {exc}")
+            self.data_count_var.set("读取失败")
+            return
+        finally:
+            try:
+                if store is not None:
+                    store.close()
+            except Exception:
+                pass
+
+        self.data_page = page
+        self._data_filters = filters
+        self.data_stat_vars["vehicles"].set(str(st.vehicles))
+        self.data_stat_vars["prices"].set(str(st.prices))
+        self.data_stat_vars["fresh"].set(str(st.fresh_prices))
+        self.data_stat_vars["expired"].set(str(max(0, st.prices - st.fresh_prices)))
+        self.data_stat_vars["hit"].set(str(st.hit_count))
+        self.data_stat_vars["remote"].set(str(st.remote_count))
+        self.data_stat_vars["rate"].set(f"{st.hit_rate * 100:.1f}%")
+        self.data_src_var.set("来源分布：" + ("、".join(
+            f"{_SOURCE_LABELS.get(c, c or '未知')} {n}" for c, n in src_rows) or "暂无记录"))
+
+        for item in self.data_tree.get_children():
+            self.data_tree.delete(item)
+        for r in rows:
+            car = " ".join(x for x in (r["brand"], r["model"]) if x)
+            price = "" if r["price"] is None else f"{r['price']:g}"
+            self.data_tree.insert("", "end", values=(
+                r["vin"], r["part_code"], r["part_name"], price,
+                _SOURCE_LABELS.get(r["source"], r["source"]),
+                "有效" if r["fresh"] else "已过期", car,
+                r["fetched_at"].replace("T", " "),
+                r["expires_at"].replace("T", " ")),
+                tags=("fresh" if r["fresh"] else "expired",))
+        self.data_page_var.set(f"第 {page} / {pages} 页")
+        self.data_count_var.set(f"共 {total} 条 · 本页 {len(rows)} 条")
+
     def _build_log_view(self):
         wrap = tk.Frame(self.content, bg=BG)
         wrap.pack(fill="both", expand=True, padx=18, pady=(14, 4))
@@ -1651,7 +2053,7 @@ class App:
                 tag = "warning"
             elif "STEP " in line:
                 tag = "step"
-            elif "✅" in line:
+            elif "✅" in line or "💾" in line:
                 tag = "success"
             else:
                 tag = "default"

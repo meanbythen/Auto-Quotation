@@ -12,12 +12,31 @@
     "index": 1,
     "ts": "2026-10-29T16:00:00.123",
     "url": "http://127.0.0.1:8765/quote_process.html",
-    "action": "click" | "fill" | "select" | "press" | "navigate" | "dialog",
-    "selector": "#submit-loss-btn",     # 优先 data-testid → id → css path
+    "action": "click" | "fill" | "select" | "press" | "navigate" | "dialog"
+              | "dropdown" | "popup" | "submit" | "open",
+    "selector": "#submit-loss-btn",     # 优先 data-testid → id → name/placeholder → css path
     "text": "提交定损单",                # 元素可见文本
-    "value": "",                        # fill/select 的值
+    "value": "",                        # fill/select 的值，press 的按键
     "tag": "button",                    # 元素标签
     "data_testid": "submit-loss-btn",   # data-testid（如果有）
+
+    // 语义上下文（生产页面是 Vue/Element UI，nth 路径不稳定，靠这些字段定位控件）
+    "label": "组别代码",                # 最近 el-form-item 标签 / 表头 / aria-label
+    "placeholder": "组号或组名",
+    "name": "", "role": "", "cls": "",
+    "dialog": "提示：请确认提交路径",     # 动作所在弹窗的标题/正文
+    "page_title": "报价工作台",
+    "page_url": "http://...", "frame_url": "http://...",
+
+    // 下拉专用（排查“读到错误下拉”类问题的关键）
+    "select_label": "组别代码",         # 下拉属于哪个字段
+    "options": ["1100000000005175-市公司报价组"],
+    "options_count": 1,
+    "option_text": "", "option_index": 0,
+
+    // 弹窗专用
+    "buttons": ["确定", "取消"],
+
     "confidence": "high" | "medium" | "low"  # selector 稳定度
   }
 """
@@ -48,7 +67,11 @@ RECORDER_JS = r"""
   window.__recorder_active__ = true;
 
   function persist() {
-    try { sessionStorage.setItem(KEY, JSON.stringify(buf)); } catch (e) {}
+    try {
+      // 上限 1500 条，避免 sessionStorage 超限后整段丢失
+      if (buf.length > 1500) buf.splice(0, buf.length - 1500);
+      sessionStorage.setItem(KEY, JSON.stringify(buf));
+    } catch (e) {}
   }
 
   // 供 Python 侧一次性取走（同时清空内存与 sessionStorage，避免重复）
@@ -59,6 +82,11 @@ RECORDER_JS = r"""
   };
 
   function now() { return new Date().toISOString(); }
+
+  function clip(s, n) {
+    const t = (s === null || s === undefined ? "" : String(s)).replace(/\s+/g, " ").trim();
+    return t.slice(0, n || 80);
+  }
 
   // 更宽的“可点击元素”判定：生产门户大量用 div / span / li / td 当按钮（没有 button/a 标签）
   const CLICK_SEL = 'button, a, input, select, textarea, label, summary, ' +
@@ -84,7 +112,7 @@ RECORDER_JS = r"""
   function genSelector(el) {
     if (!(el instanceof Element)) return "";
     // 1) data-testid（最稳定）
-    if (el.dataset.testid) return `[data-testid="${el.dataset.testid}"]`;
+    if (el.dataset && el.dataset.testid) return `[data-testid="${el.dataset.testid}"]`;
     // 2) id
     if (el.id) return `#${CSS.escape(el.id)}`;
     // 3) name + tag
@@ -108,32 +136,165 @@ RECORDER_JS = r"""
     return parts.join(' > ');
   }
 
-  function push(action, el, extra = {}) {
+  // 语义化 selector：生产是 Vue/Element UI，nth 路径极不稳定，
+  // 优先用 placeholder / aria-label / 表单项标签反推，便于事后定位控件
+  function stableSelector(el) {
+    try {
+      if (el.dataset && el.dataset.testid) return `[data-testid="${el.dataset.testid}"]`;
+      if (el.id) return `#${CSS.escape(el.id)}`;
+      const tag = (el.tagName || "").toLowerCase();
+      const name = el.getAttribute && el.getAttribute("name");
+      if (name) return `${tag}[name="${name}"]`;
+      const ph = el.getAttribute && el.getAttribute("placeholder");
+      if (ph && tag === "input") return `input[placeholder="${ph}"]`;
+      const al = el.getAttribute && el.getAttribute("aria-label");
+      if (al) return `${tag}[aria-label="${al}"]`;
+    } catch (e) {}
+    return genSelector(el);
+  }
+
+  // 找最近的表单标签 / 表头，解决“只知道点了 input，不知道该 input 是哪个字段”
+  function labelOf(el) {
+    try {
+      if (!el || el.nodeType !== 1) return "";
+      const item = el.closest('.el-form-item, .form-item, .form-group, .ant-form-item, .layui-form-item, td');
+      if (item) {
+        const lb = item.querySelector('.el-form-item__label, .ant-form-item-label, label');
+        if (lb) {
+          const t = clip(lb.innerText, 60);
+          if (t) return t;
+        }
+        if (item.tagName === 'TD') {
+          const tr = item.parentElement;
+          if (tr && tr.cells && tr.cells.length > 1 && tr.cells[0] !== item) {
+            const t = clip(tr.cells[0].innerText, 40);
+            if (t) return t;
+          }
+        }
+      }
+      if (el.labels && el.labels.length) return clip(el.labels[0].innerText, 60);
+      const al = el.getAttribute && el.getAttribute('aria-label');
+      if (al) return clip(al, 60);
+      const ph = el.getAttribute && el.getAttribute('placeholder');
+      if (ph) return clip(ph, 60);
+      // 仅输入类控件才用“紧邻文本”兜底，按钮用相邻文字当标签会误标成别的字段
+      if (/^(input|select|textarea)$/i.test(el.tagName || '')) {
+        const prev = el.previousElementSibling;
+        if (prev) return clip(prev.innerText, 40);
+      }
+    } catch (e) {}
+    return "";
+  }
+
+  // 当前动作发生在哪个弹窗里（提示框 / 报价任务提交弹窗等）
+  function dialogOf(el) {
+    try {
+      const dlg = el && el.closest
+        ? el.closest('.el-message-box, .el-dialog, .modal.in, .modal.show, .ant-modal, .layui-layer')
+        : null;
+      if (!dlg) return "";
+      const head = dlg.querySelector('.el-message-box__title, .el-dialog__title, .modal-title, .el-message-box__message');
+      return clip(head ? head.innerText : dlg.innerText, 160);
+    } catch (e) { return ""; }
+  }
+
+  // 记录当前聚焦的 select（Element UI 的下拉被 teleport 到 body，
+  // 与输入框没有 DOM 关联，只能靠 focusin 记下“最近操作的是哪个字段”）
+  const activeSel = { label: "", ph: "" };
+  document.addEventListener('focusin', (ev) => {
+    const el = ev.target;
+    if (!el || !el.matches || !el.matches('input')) return;
+    const sel = el.closest('.el-select, .ant-select, .layui-form-select, .select2');
+    if (!sel) return;
+    activeSel.label = labelOf(sel) || labelOf(el);
+    activeSel.ph = (el.getAttribute('placeholder') || "");
+  }, true);
+
+  function infoOf(el) {
+    if (!el || el.nodeType !== 1) return {};
+    let cls = "";
+    try { cls = (el.className && el.className.toString ? el.className.toString() : "") || ""; } catch (e) {}
+    return {
+      label: labelOf(el),
+      placeholder: (el.getAttribute && el.getAttribute("placeholder")) || "",
+      name: (el.getAttribute && el.getAttribute("name")) || "",
+      role: (el.getAttribute && el.getAttribute("role")) || "",
+      cls: clip(cls, 80),
+      dialog: dialogOf(el),
+      readonly: !!(el.readOnly || (el.getAttribute && el.getAttribute("readonly") !== null)),
+      disabled: !!(el.disabled || (el.getAttribute && el.getAttribute("disabled") !== null)),
+      href: (el.getAttribute && el.getAttribute("href")) || "",
+      page_title: clip(document.title, 80),
+    };
+  }
+
+  function push(action, el, extra) {
     if (!window.__recorder_active__) return;
-    const selector = el ? genSelector(el) : "";
-    buf.push({
+    const rec = {
       index: buf.length + 1,
       ts: now(),
       url: location.href,
-      action,
-      selector,
-      text: el ? (el.innerText || el.value || "").toString().trim().slice(0, 80) : "",
+      action: action,
+      selector: el ? stableSelector(el) : "",
+      text: el ? clip(el.innerText || el.value, 80) : "",
       tag: el ? el.tagName.toLowerCase() : "",
-      data_testid: el ? (el.dataset.testid || "") : "",
-      html: el && el.outerHTML ? el.outerHTML.slice(0, 200) : "",
-      ...extra,
-    });
+      data_testid: el && el.dataset ? (el.dataset.testid || "") : "",
+      html: el && el.outerHTML ? String(el.outerHTML).slice(0, 300) : "",
+      value: "",
+      page_title: clip(document.title, 80),
+    };
+    const out = Object.assign(rec, el ? infoOf(el) : {}, extra || {});
+    buf.push(out);
     persist();
   }
 
-  // ---- click（按钮 / 链接 / 单选复选 / 手型 div-span-li）----
+  // 可见性判断（Element UI 的下拉/弹窗都是 style 切换，不能用 offsetParent）
+  function isVisible(el) {
+    try {
+      const st = getComputedStyle(el);
+      if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    } catch (e) { return false; }
+  }
+
+  const ITEM_SEL = '.el-select-dropdown__item, .ant-select-item-option, .layui-form-select dd, .select2-results__option';
+  function itemsOf(drop) {
+    const out = [];
+    drop.querySelectorAll(ITEM_SEL + ', li').forEach((li) => {
+      if (!isVisible(li)) return;
+      const t = clip(li.innerText, 60);
+      if (t && out.indexOf(t) < 0) out.push(t);
+    });
+    return out;
+  }
+
+  // ---- click（按钮 / 链接 / 单选复选 / 下拉选项 / 手型 div-span-li）----
   document.addEventListener('click', (ev) => {
-    const el = clickableOf(ev.target);
-    if (el) push('click', el);
-    else if (ev.target && ev.target.nodeType === 1) {
-      // 兜底：未知元素也记一条（生产门户的奇怪控件）
-      const txt = (ev.target.innerText || '').trim();
-      if (txt && txt.length <= 40) push('click', ev.target);
+    const raw = ev.target;
+    let extra = {};
+
+    // 下拉项点击：带上「属于哪个字段 + 第几项 + 全部选项」，
+    // 生产排查"读到 8 项其实是提交路径下拉"就靠这个信息
+    const li = raw && raw.closest ? raw.closest(ITEM_SEL) : null;
+    if (li) {
+      const drop = li.closest('.el-select-dropdown, .ant-select-dropdown, .layui-form-select, .select2-results');
+      const items = drop ? itemsOf(drop) : [];
+      extra = {
+        option_text: clip(li.innerText, 60),
+        option_index: li.parentElement ? Array.from(li.parentElement.children).indexOf(li) + 1 : 0,
+        options: items.slice(0, 30),
+        options_count: items.length,
+        select_label: activeSel.label || "",
+        select_placeholder: activeSel.ph || "",
+      };
+    }
+
+    const el = clickableOf(raw);
+    if (el) push('click', el, extra);
+    else if (raw && raw.nodeType === 1) {
+      const txt = clip(raw.innerText, 40);
+      if (txt) push('click', raw, extra);
     }
   }, true);
 
@@ -144,7 +305,7 @@ RECORDER_JS = r"""
     const v = (el.value === null || el.value === undefined ? "" : String(el.value)).slice(0, 120);
     if (lastFill.get(el) === v) return;
     lastFill.set(el, v);
-    push('fill', el, { value: v });
+    push('fill', el, { value: v, select_label: activeSel.label || "" });
   }
 
   document.addEventListener('input', (ev) => {
@@ -190,14 +351,86 @@ RECORDER_JS = r"""
     };
   }
 
-  // ---- SPA hash change (navigation) ----
+  // ---- SPA 路由（pushState/replaceState 不触发 hashchange）----
+  ['pushState', 'replaceState'].forEach((fn) => {
+    const orig = history[fn];
+    if (typeof orig !== 'function') return;
+    history[fn] = function() {
+      const r = orig.apply(this, arguments);
+      setTimeout(() => push('navigate', null, { value: location.href, text: 'SPA 路由' }), 0);
+      return r;
+    };
+  });
   window.addEventListener('hashchange', () => {
     push('navigate', null, { value: location.hash || location.pathname });
   });
-
   window.addEventListener('popstate', () => {
     push('navigate', null, { value: location.href });
   });
+
+  // ---- UI 状态扫描：下拉展开 / 弹窗出现 ----
+  // 这类界面用 v-show 切换，DOM 一直是存在的，靠 MutationObserver 很难抓；
+  // 500ms 轮询 + 签名去重最稳，也不贵。
+  const seenDrop = new WeakMap();
+  const seenPop = new WeakMap();
+
+  function scanUI() {
+    if (!window.__recorder_active__) return;
+
+    document.querySelectorAll('.el-select-dropdown, .ant-select-dropdown, .layui-form-select dl, .select2-results').forEach((d) => {
+      const vis = isVisible(d);
+      const items = vis ? itemsOf(d) : [];
+      const sig = vis && items.length ? items.join('|') : '';
+      const prev = seenDrop.get(d) || '';
+      if (sig && sig !== prev) {
+        seenDrop.set(d, sig);
+        push('dropdown', null, {
+          text: (activeSel.label || '下拉') + ' 共 ' + items.length + ' 项',
+          value: items.join(' | ').slice(0, 300),
+          label: activeSel.label || '',
+          select_label: activeSel.label || '',
+          select_placeholder: activeSel.ph || '',
+          options: items.slice(0, 30),
+          options_count: items.length,
+        });
+      } else if (!vis && prev) {
+        seenDrop.set(d, '');
+      }
+    });
+
+    document.querySelectorAll('.el-message-box, .el-dialog, .modal.in, .modal.show, .ant-modal, .layui-layer').forEach((d) => {
+      if (!isVisible(d)) {
+        if (seenPop.get(d)) seenPop.set(d, '');
+        return;
+      }
+      const titleEl = d.querySelector('.el-message-box__title, .el-dialog__title, .modal-title, .ant-modal-title');
+      const body = clip(d.innerText, 200);
+      // 标题为空时必须回退到正文：生产出现过「标题空 + 只有确定按钮」的提示框
+      //（.el-message-box.not_show_alert，按钮 .close_alert），只认标题会导致整条 popup 被丢弃
+      let sig = clip(titleEl ? titleEl.innerText : "", 120);
+      if (!sig) sig = body;
+      const btns = [];
+      d.querySelectorAll('button, .el-button, .btn, [role="button"]').forEach((b) => {
+        if (!isVisible(b)) return;
+        const t = clip(b.innerText, 20);
+        if (t && btns.indexOf(t) < 0) btns.push(t);
+      });
+      if (!sig && btns.length) sig = '（无文案提示框）' + btns.join(' / ');
+      if (!sig || seenPop.get(d) === sig) return;
+      seenPop.set(d, sig);
+
+      let cls = "";
+      try { cls = (d.className && d.className.toString ? d.className.toString() : ""); } catch (e) {}
+      push('popup', null, {
+        text: sig,
+        dialog: body,
+        value: btns.join(' / '),
+        cls: clip(cls, 80),
+        buttons: btns.slice(0, 10),
+      });
+    });
+  }
+  setInterval(scanUI, 500);
 })();
 """
 
@@ -218,6 +451,25 @@ class WorkflowStep:
         self.tag = raw.get("tag", "")
         self.data_testid = raw.get("data_testid", "")
         self.html = raw.get("html", "")
+        # ---- 语义上下文（录制学习用：脱离 nth 路径也能知道操作的是哪个字段）----
+        self.label = raw.get("label", "")
+        self.placeholder = raw.get("placeholder", "")
+        self.name = raw.get("name", "")
+        self.role = raw.get("role", "")
+        self.cls = raw.get("cls", "")
+        self.dialog = raw.get("dialog", "")
+        self.page_title = raw.get("page_title", "")
+        self.page_url = raw.get("page_url", "")
+        self.frame_url = raw.get("frame_url", "")
+        # ---- 下拉专用（dropdown / 选项点击）----
+        self.select_label = raw.get("select_label", "")
+        self.select_placeholder = raw.get("select_placeholder", "")
+        self.options = raw.get("options") or []
+        self.options_count = raw.get("options_count", len(self.options))
+        self.option_text = raw.get("option_text", "")
+        self.option_index = raw.get("option_index", 0)
+        # ---- 弹窗专用（popup）----
+        self.buttons = raw.get("buttons") or []
 
     def to_dict(self) -> Dict[str, Any]:
         return self.__dict__.copy()
@@ -225,7 +477,11 @@ class WorkflowStep:
     @property
     def canonical(self) -> str:
         """canonical form 用于 diff：action + 核心标识"""
+        # 字段标签比 nth 路径稳定得多：有 label 时优先用 label
         key = self.data_testid or self.selector or self.text
+        if self.label and not self.data_testid:
+            suffix = self.option_text or self.text or ""
+            key = f"{self.label}>{suffix}" if suffix else self.label
         # 归一化：报案号里的时间戳、URL query 参数都去掉
         key = re.sub(r'RD[A-Za-z]{2}[0-9A-Za-z]{16,20}', '<CLAIM>', key)
         key = re.sub(r'\?.*$', '', key)
@@ -343,6 +599,21 @@ class Recorder:
         except Exception:
             pass
 
+    def pages(self) -> List[Page]:
+        """录制中的存活页面（按创建顺序，末位是最近打开的新标签）"""
+        return [p for p in self._pages if not p.is_closed()]
+
+    def find_page(self, url: str = "") -> Optional[Page]:
+        """按 url 找录制中的页面（快照用），找不到返回 None"""
+        pages = [p for p in self._pages if not p.is_closed()]
+        for p in pages:
+            try:
+                if url and (p.url or "") == url:
+                    return p
+            except Exception:
+                continue
+        return pages[-1] if pages else None
+
     async def status(self) -> Dict[str, Any]:
         """录制诊断：窗口数 / frame 数 / 已注入数（0 注入说明录制没生效）"""
         pages = [p for p in self._pages if not p.is_closed()]
@@ -391,7 +662,17 @@ class Recorder:
                     except Exception:
                         pass
                     continue
-                collected.extend(raw or [])
+                # 补上 Python 侧才拿得到的定位信息：动作发生在哪个页面 / 哪个 iframe
+                title = ""
+                try:
+                    title = await page.title()
+                except Exception:
+                    pass
+                for s in (raw or []):
+                    s.setdefault("page_url", cur or "")
+                    s.setdefault("frame_url", frame.url or "")
+                    s.setdefault("page_title", title)
+                    collected.append(s)
 
         collected.extend(self._events)
         self._events = []

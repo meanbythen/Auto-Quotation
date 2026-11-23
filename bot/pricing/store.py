@@ -50,6 +50,34 @@ CREATE TABLE IF NOT EXISTS query_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_query_log_ts ON query_log(ts DESC);
+
+CREATE TABLE IF NOT EXISTS app_setting (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS claim_part_quote_fix (
+    claim_no    TEXT NOT NULL,
+    part_code   TEXT NOT NULL,
+    part_name   TEXT DEFAULT '',
+    quote_price REAL,
+    fixed_at    TEXT NOT NULL,
+    PRIMARY KEY (claim_no, part_code)
+);
+
+CREATE TABLE IF NOT EXISTS claim_process_history (
+    claim_no            TEXT PRIMARY KEY,
+    first_processed_at  TEXT NOT NULL,
+    last_processed_at   TEXT NOT NULL,
+    passes              INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS claim_color_return_history (
+    claim_no    TEXT PRIMARY KEY,
+    returned_at TEXT NOT NULL,
+    pass_count  INTEGER NOT NULL DEFAULT 1,
+    note        TEXT DEFAULT ''
+);
 """
 
 
@@ -248,3 +276,306 @@ class PriceStore:
             return cur.rowcount or 0
         except sqlite3.Error:
             return 0
+
+    # ---------- 价格有效期设置 ----------
+    def get_valid_days(self, default: int = 90) -> int:
+        """读取用户设置的有效期（天），未设置返回默认值"""
+        if self._conn is None:
+            return default
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT value FROM app_setting WHERE key='price_valid_days'").fetchone()
+        except sqlite3.Error:
+            return default
+        if not row:
+            return default
+        try:
+            return max(1, min(3650, int(row[0])))
+        except (TypeError, ValueError):
+            return default
+
+    def set_valid_days(self, days: int) -> int:
+        """保存有效期，并按 fetched_at 重算已有记录的到期时间；返回重算行数"""
+        days = max(1, min(3650, int(days)))
+        if self._conn is None:
+            return 0
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO app_setting(key, value) VALUES('price_valid_days', ?)"
+                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(days),))
+                cur = self._conn.execute(
+                    "UPDATE part_price SET expires_at ="
+                    " strftime('%Y-%m-%dT%H:%M:%S', datetime(fetched_at, ?))",
+                    (f"+{days} days",))
+                self._conn.commit()
+        except sqlite3.Error:
+            return 0
+        return cur.rowcount or 0
+
+    # ---------- 通用设置 ----------
+    def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        if self._conn is None:
+            return default
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT value FROM app_setting WHERE key=?", (key,)).fetchone()
+            return str(row[0]) if row else default
+        except sqlite3.Error:
+            return default
+
+    def set_setting(self, key: str, value: str) -> bool:
+        if self._conn is None:
+            return False
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO app_setting(key, value) VALUES(?, ?)"
+                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, str(value)))
+                self._conn.commit()
+            return True
+        except sqlite3.Error:
+            return False
+
+    # ---------- 报案零件改价历史（幂等护栏，不受价格缓存开关影响） ----------
+    def get_claim_quote_fixes(self, claim_no: str) -> Optional[dict[str, dict]]:
+        """返回零件键 → 首次改价信息；None 表示读取失败，调用方应停止自动改价"""
+        claim_no = (claim_no or "").strip().upper()
+        if not claim_no or self._conn is None:
+            return None
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT part_code, part_name, quote_price, fixed_at"
+                    " FROM claim_part_quote_fix WHERE claim_no=?", (claim_no,)).fetchall()
+            return {r[0]: {"part_name": r[1] or "", "quote_price": r[2],
+                           "fixed_at": r[3] or ""} for r in rows}
+        except sqlite3.Error:
+            return None
+
+    def add_claim_quote_fix(self, claim_no: str, part_code: str,
+                            quote_price: Optional[float], part_name: str = "",
+                            fixed_at: str = "") -> bool:
+        return self.add_claim_quote_fixes([{
+            "claim_no": claim_no, "part_code": part_code,
+            "quote_price": quote_price, "part_name": part_name,
+            "fixed_at": fixed_at,
+        }])
+
+    def add_claim_quote_fixes(self, records: Iterable[dict]) -> bool:
+        """只登记首次改价；已存在记录保持原值，空集合也视为成功"""
+        if self._conn is None:
+            return False
+        rows = []
+        for rec in records:
+            claim_no = str(rec.get("claim_no") or "").strip().upper()
+            part_code = str(rec.get("part_code") or "").strip().upper()
+            if not claim_no or not part_code:
+                continue
+            price = rec.get("quote_price")
+            try:
+                price = float(price) if price is not None else None
+            except (TypeError, ValueError):
+                price = None
+            fixed_at = str(rec.get("fixed_at") or "") or _iso(_now())
+            rows.append((claim_no, part_code, str(rec.get("part_name") or ""),
+                         price, fixed_at))
+        try:
+            with self._lock:
+                self._conn.executemany(
+                    "INSERT OR IGNORE INTO claim_part_quote_fix"
+                    "(claim_no, part_code, part_name, quote_price, fixed_at)"
+                    " VALUES(?,?,?,?,?)", rows)
+                self._conn.commit()
+            return True
+        except sqlite3.Error:
+            return False
+
+    # ---------- 本工号处理过的报案号（决定提交上级后的收回路径） ----------
+    def claim_processed_before(self, claim_no: str) -> bool:
+        claim_no = (claim_no or "").strip().upper()
+        if not claim_no or self._conn is None:
+            return False
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT 1 FROM claim_process_history WHERE claim_no=?",
+                    (claim_no,)).fetchone()
+            return row is not None
+        except sqlite3.Error:
+            return False
+
+    def mark_claim_processed(self, claim_no: str,
+                             processed_at: str = "") -> bool:
+        claim_no = (claim_no or "").strip().upper()
+        if not claim_no or self._conn is None:
+            return False
+        ts = processed_at or _iso(_now())
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO claim_process_history"
+                    "(claim_no, first_processed_at, last_processed_at, passes)"
+                    " VALUES(?,?,?,1)"
+                    " ON CONFLICT(claim_no) DO UPDATE SET"
+                    " last_processed_at=excluded.last_processed_at,"
+                    " passes=claim_process_history.passes+1",
+                    (claim_no, ts, ts))
+                self._conn.commit()
+            return True
+        except sqlite3.Error:
+            return False
+
+    def add_claim_process_history(self, records: Iterable[dict]) -> bool:
+        """历史工作记录导入：只补充不存在的报案号，空集合也视为成功"""
+        if self._conn is None:
+            return False
+        rows = []
+        for rec in records:
+            claim_no = str(rec.get("claim_no") or "").strip().upper()
+            if not claim_no:
+                continue
+            ts = str(rec.get("processed_at") or "") or _iso(_now())
+            rows.append((claim_no, ts, ts, 1))
+        if not rows:
+            return True
+        try:
+            with self._lock:
+                self._conn.executemany(
+                    "INSERT OR IGNORE INTO claim_process_history"
+                    "(claim_no, first_processed_at, last_processed_at, passes)"
+                    " VALUES(?,?,?,?)", rows)
+                self._conn.commit()
+            return True
+        except sqlite3.Error:
+            return False
+
+    # ---------- 因蓝色/纯橙色退回过的报案号（二次进入按正常案件处理） ----------
+    def claim_color_returned_before(self, claim_no: str) -> bool:
+        claim_no = (claim_no or "").strip().upper()
+        if not claim_no or self._conn is None:
+            return False
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT 1 FROM claim_color_return_history WHERE claim_no=?",
+                    (claim_no,)).fetchone()
+            return row is not None
+        except sqlite3.Error:
+            return False
+
+    def mark_claim_color_returned(self, claim_no: str, note: str = "") -> bool:
+        claim_no = (claim_no or "").strip().upper()
+        if not claim_no or self._conn is None:
+            return False
+        ts = _iso(_now())
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO claim_color_return_history"
+                    "(claim_no, returned_at, pass_count, note)"
+                    " VALUES(?,?,1,?)"
+                    " ON CONFLICT(claim_no) DO UPDATE SET"
+                    " returned_at=excluded.returned_at,"
+                    " pass_count=claim_color_return_history.pass_count+1,"
+                    " note=excluded.note",
+                    (claim_no, ts, note))
+                self._conn.commit()
+            return True
+        except sqlite3.Error:
+            return False
+
+    # ---------- 数据管理（综合查询 / 统计） ----------
+    def _part_filters(self, part_code: str = "", part_name: str = "",
+                      source: str = "", status: str = "",
+                      vin: str = "") -> tuple[str, list, str]:
+        """拼 WHERE：status=fresh 有效 / expired 已过期 / 空 全部"""
+        now = _iso(_now())
+        sql = " FROM part_price p LEFT JOIN vehicle v ON v.vin=p.vin WHERE 1=1"
+        args: list = []
+        if vin.strip():
+            sql += " AND p.vin LIKE ?"
+            args.append(f"%{vin.strip()}%")
+        if part_code.strip():
+            sql += " AND p.part_code LIKE ?"
+            args.append(f"%{part_code.strip()}%")
+        if part_name.strip():
+            sql += " AND p.part_name LIKE ?"
+            args.append(f"%{part_name.strip()}%")
+        if source:
+            sql += " AND p.source=?"
+            args.append(source)
+        if status == "fresh":
+            sql += " AND p.expires_at>?"
+            args.append(now)
+        elif status == "expired":
+            sql += " AND p.expires_at<=?"
+            args.append(now)
+        return sql, args, now
+
+    def search_parts(self, *, part_code: str = "", part_name: str = "",
+                     source: str = "", status: str = "", vin: str = "",
+                     limit: int = 500, offset: int = 0) -> tuple[list[dict], int]:
+        """条件查询零件价格记录，返回 (当前页行, 总条数)"""
+        if self._conn is None:
+            return [], 0
+        where, args, now = self._part_filters(part_code, part_name, source, status, vin)
+        sql = ("SELECT p.vin, p.part_code, p.part_name, p.price, p.source,"
+               " p.fetched_at, p.expires_at, v.brand, v.model,"
+               " CASE WHEN p.expires_at>? THEN 1 ELSE 0 END" + where +
+               " ORDER BY p.fetched_at DESC, p.id DESC LIMIT ? OFFSET ?")
+        try:
+            with self._lock:
+                total = self._conn.execute(
+                    "SELECT COUNT(*)" + where, args).fetchone()[0]
+                rows = self._conn.execute(
+                    sql, [now] + args + [max(1, int(limit)), max(0, int(offset))]).fetchall()
+        except sqlite3.Error:
+            return [], 0
+        out = []
+        for r in rows:
+            out.append({
+                "vin": r[0] or "", "part_code": r[1] or "", "part_name": r[2] or "",
+                "price": r[3], "source": r[4] or "",
+                "fetched_at": r[5] or "", "expires_at": r[6] or "",
+                "brand": r[7] or "", "model": r[8] or "", "fresh": bool(r[9]),
+            })
+        return out, total
+
+    def iter_parts(self, *, part_code: str = "", part_name: str = "",
+                   source: str = "", status: str = "", vin: str = ""):
+        """按条件惰性遍历全部命中记录（导出 Excel 用，不一次性载入内存）"""
+        if self._conn is None:
+            return
+        where, args, now = self._part_filters(part_code, part_name, source, status, vin)
+        sql = ("SELECT p.vin, p.part_code, p.part_name, p.price, p.source,"
+               " p.fetched_at, p.expires_at, v.brand, v.model,"
+               " CASE WHEN p.expires_at>? THEN 1 ELSE 0 END" + where +
+               " ORDER BY p.fetched_at DESC, p.id DESC")
+        try:
+            with self._lock:
+                for r in self._conn.execute(sql, [now] + args):
+                    yield {
+                        "vin": r[0] or "", "part_code": r[1] or "",
+                        "part_name": r[2] or "", "price": r[3], "source": r[4] or "",
+                        "fetched_at": r[5] or "", "expires_at": r[6] or "",
+                        "brand": r[7] or "", "model": r[8] or "", "fresh": bool(r[9]),
+                    }
+        except sqlite3.Error:
+            return
+
+    def source_stats(self) -> list[tuple[str, int]]:
+        """按来源统计记录数（数据管理页来源筛选/分布用）"""
+        if self._conn is None:
+            return []
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT source, COUNT(*) FROM part_price"
+                    " GROUP BY source ORDER BY COUNT(*) DESC").fetchall()
+        except sqlite3.Error:
+            return []
+        return [(r[0] or "", int(r[1])) for r in rows]

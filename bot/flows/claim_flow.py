@@ -27,6 +27,7 @@ from bot.page_objects import (
     step_loss_fix_over_market,
     step_loss_submit,
     step_quote_finalize,
+    step_quote_return_for_color_parts,
     step_quote_submit_superior,
     step_task_transfer_back,
     step_quote_reopen_finalize,
@@ -148,6 +149,8 @@ async def _finalize_with_fallback(portal_page, ctx: dict, result: BotRunResult,
 
         async with rec.step("STEP 9a", STEP_NAMES["STEP 9a"]) as st:
             await gate.checkpoint("STEP 9a 报价页 → 业务动作『提交上级』")
+            # 先标记：本处理轮次内即使提交失败，也不在兜底/重试里再次提交上级
+            ctx["high_amount_transferred"] = True
             await step_quote_submit_superior(
                 portal_page, ctx, **_workflow_step_kwargs("quote_submit_superior"))
             st.detail.update(submit_path=ctx.get("transfer_submit_path", ""),
@@ -169,6 +172,14 @@ async def _finalize_with_fallback(portal_page, ctx: dict, result: BotRunResult,
         result.messages.append("分中心报价已提交（本环节完成）")
         log_run(f"route=branch_center 完成 | 报案号={claim_no}")
         print(f"\n  ✅ 分中心报价完成：任务已提交远程操作平台（{claim_no}）")
+        return ROUTE_HIGH_AMOUNT
+
+    # ★ 二次处理：提交上级后点快速链接『处理』，已在当前页完成『报价完成』→ 不做平级移交
+    if ctx.pop("quick_process_done", False):
+        result.status = "done"
+        result.messages.append("二次处理：提交上级 → 快速链接处理 → 报价完成")
+        log_run(f"route=high_amount（二次处理快速链接）完成 | 报案号={claim_no}")
+        print(f"\n  ✅ 二次处理完成：提交上级 → 快速链接处理 → 报价完成（{claim_no}）")
         return ROUTE_HIGH_AMOUNT
 
     # STEP 9 内部已按『报价汇总换件金额 > 4 万』走了提交上级 → 继续平级移交 + 报价完成
@@ -337,55 +348,6 @@ async def run_claim_flow(env, ctx: dict, result: Optional[BotRunResult] = None,
             else:
                 raise
 
-    # ==================== 分支：重复处理（同一报案号第二次出现） ====================
-    # 业务上同一报案号会再次回到列表：点进定损平台 → 全选 → 同步定损 → 提交定损单 →
-    # 报价完成。不再查一车一件、不再改价（价格首轮已确定）。
-    if ctx.get("reprocess"):
-        print(f"\n{'='*70}")
-        print(f"  🔁 重复处理：{claim_no} 已完成全选 + 同步定损 → 跳过比价/改价，直接提交")
-        print(f"{'='*70}")
-        log_run(f"重复处理模式生效 | 报案号={claim_no}")
-        for code in ("STEP 4", "STEP 5", "STEP 6", "STEP 7"):
-            rec.mark(code, "skipped", reason="重复处理：跳过比价与改价")
-
-        # 只读一次零件清单用于工作记录（读不到不影响提交）
-        try:
-            vehicle, parts = await step_loss_extract_data(loss_page, ctx)
-            ctx["vehicle"], ctx["parts"] = vehicle, parts
-            result.vehicle, result.parts = vehicle, parts
-        except Exception as exc:
-            print(f"  [i] 重复处理读取零件清单失败（不影响提交）: "
-                  f"{type(exc).__name__}: {str(exc).splitlines()[0][:120]}")
-
-        if dry_run:
-            result.status = "dry_run"
-            rec.mark("STEP 8", "skipped", reason="演练模式")
-            rec.mark("STEP 9", "skipped", reason="演练模式")
-            print(f"\n  🛡 演练模式：跳过『提交定损』与『报价完成』")
-            return "dry_run"
-
-        await loss_page.bring_to_front()
-        async with rec.step("STEP 8", STEP_NAMES["STEP 8"]):
-            await gate.checkpoint("STEP 8 定损平台 → 提交定损单")
-            try:
-                await step_loss_submit(loss_page, ctx)
-            except Exception as exc:
-                print(f"\n  ⚠️ STEP 8 提交定损单异常（不中断案件，继续报价提交）: "
-                      f"{type(exc).__name__}: {str(exc).splitlines()[0][:160]}")
-                log_audit(f"重复处理 STEP 8 异常，继续报价提交：{exc}")
-
-        await quote_page.bring_to_front()
-        async with rec.step("STEP 9", STEP_NAMES["STEP 9"]) as st:
-            await gate.checkpoint("STEP 9 报价处理 → 报价完成 → 提交任务")
-            st.detail["route"] = await _finalize_with_fallback(quote_page, ctx, result, rec)
-
-        result.status = "done"
-        print(f"\n{'='*70}")
-        print(f"  🎉 重复处理完成！")
-        print(f"  报案号:   {claim_no}")
-        print(f"{'='*70}")
-        return "reprocess"
-
     async with rec.step("STEP 4", STEP_NAMES["STEP 4"]) as st:
         await gate.checkpoint("STEP 4 定损平台 → 提取 VIN + 换件列表")
         try:
@@ -400,6 +362,24 @@ async def run_claim_flow(env, ctx: dict, result: Optional[BotRunResult] = None,
         result.vehicle = vehicle
         result.parts = parts
         st.detail.update(vin=vehicle.vin, parts=len(parts))
+
+    # ==================== 分支：零件名称颜色需人工处理 → 先正常走完 STEP 5~8 ====================
+    # 生产规则：不再在 STEP 4 直接跳过；同步定损、比价、改价、提交定损单照常执行，
+    # 只到 STEP 9 选业务动作『报价完成』之前才跳过提交。
+    if ctx.get("skip_part_color") or ctx.get("return_part_color"):
+        bad = ctx.get("skip_part_color_parts") or []
+        names = "、".join(str(p.get("name")) for p in bad[:5])
+        colors = "、".join(str(p.get("color")) for p in bad[:5])
+        action = ("STEP 9 选业务动作『退回』"
+                  if ctx.get("return_part_color") else "STEP 9 前跳过")
+        print(f"\n{'='*70}")
+        print(f"  ⚠️ 零件名称颜色需人工处理 → 先正常执行 STEP 5~8，{action}")
+        print(f"  报案号: {claim_no}")
+        print(f"  零件:   {names}")
+        print(f"  颜色:   {colors}")
+        print(f"{'='*70}")
+        log_run(f"零件名称颜色需人工处理 → 继续 STEP 5~8，{action} | "
+                f"报案号={claim_no} | {names} | {colors}")
 
     # ==================== 分支：直供价有值 → 取消直供价后按正常案件继续 ====================
     # 处理方式：切换「价格类型」把直供价清掉（R → 原类型 A/S）→ 保存 →
@@ -521,7 +501,7 @@ async def run_claim_flow(env, ctx: dict, result: Optional[BotRunResult] = None,
                 tolerance=float(ctx.get("tolerance") or 0))
             if cached_parts:
                 print(f"\n  💾 本地价格库命中 {len(cached_parts)}/{len(target_parts)} 件"
-                      f"（有效期 {cfg.PRICE_CACHE_VALID_DAYS} 天）→ 这些零件不再查一车一件")
+                      f"（有效期 {price_svc.valid_days} 天）→ 这些零件不再查一车一件")
                 log_audit(f"本地价格库命中 {len(cached_parts)}/{len(target_parts)} 件，"
                           f"剩余 {len(remote_parts)} 件需远程查询")
 
@@ -679,6 +659,52 @@ async def run_claim_flow(env, ctx: dict, result: Optional[BotRunResult] = None,
                 print(f"\n  ⚠️ STEP 8 提交定损单异常（不中断案件，继续报价提交）: "
                       f"{type(exc).__name__}: {str(exc).splitlines()[0][:160]}")
                 log_audit(f"STEP 8 提交定损单异常，继续报价提交：{exc}")
+
+    # ==================== STEP 9R：蓝色 / 纯橙色零件 → 业务动作『退回』 ====================
+    # 前面 STEP 1~8 已正常完成；零件名称蓝色/纯橙色的案件不选『报价完成』，
+    # 改为『退回』+ 填写意见 → 评价页勾选最后一项 → 二次提交任务。
+    if ctx.get("return_part_color"):
+        blue = ctx.get("return_blue_parts") or []
+        orange = ctx.get("return_orange_parts") or []
+        names = "、".join(str(p.get("name")) for p in (blue + orange)[:5])
+        print(f"\n{'='*70}")
+        print(f"  ↩️ STEP 1~8 已完成；零件名称蓝色/纯橙色 → 业务动作改『退回』")
+        print(f"  报案号: {claim_no}")
+        print(f"  零件:   {names}")
+        print(f"{'='*70}")
+        await quote_page.bring_to_front()
+        async with rec.step("STEP 9", STEP_NAMES["STEP 9"]) as st:
+            await gate.checkpoint("STEP 9 报价处理 → 业务动作『退回』→ 评分 → 提交任务")
+            try:
+                await step_quote_return_for_color_parts(quote_page, ctx)
+            except Exception as exc:
+                if await _skill_try("STEP 9", quote_page, str(exc), ctx):
+                    await step_quote_return_for_color_parts(quote_page, ctx)
+                else:
+                    raise
+            st.detail["route"] = "return_part_color"
+        result.status = "done"
+        result.messages.append(f"零件名称蓝色/纯橙色 → 已退回（{names}）")
+        log_run(f"零件名称蓝色/纯橙色 → 退回并提交成功 | 报案号={claim_no} | {names}")
+        return "return_part_color"
+
+    # ==================== STEP 9 前跳过：其他颜色零件 → 不提交 ====================
+    # 前面 STEP 1~8（同步定损 / 查价 / 改价 / 提交定损单）已正常完成，
+    # 这里不再选业务动作『报价完成』，也不提交任务，直接跳过等人工处理。
+    if ctx.get("skip_part_color"):
+        bad = ctx.get("skip_part_color_parts") or []
+        names = "、".join(str(p.get("name")) for p in bad[:5])
+        print(f"\n{'='*70}")
+        print(f"  ⏭ STEP 1~8 已完成；零件名称颜色需人工处理 → 不提交『报价完成』，跳过")
+        print(f"  报案号: {claim_no}")
+        print(f"  零件:   {names}")
+        print(f"{'='*70}")
+        result.status = "skipped"
+        result.messages.append(
+            f"零件名称颜色需人工处理（{names}）→ STEP 1~8 已完成，未提交报价完成")
+        rec.mark("STEP 9", "skipped", reason="零件名称颜色需人工处理，未提交报价完成")
+        log_run(f"零件名称颜色需人工处理 → STEP 9 前跳过 | 报案号={claim_no} | {names}")
+        return "skip_part_color"
 
     await quote_page.bring_to_front()
     async with rec.step("STEP 9", STEP_NAMES["STEP 9"]) as st:

@@ -462,6 +462,175 @@ async def _choose_dropdown_text(
     log_audit(f"{label} 已选: {val}")
 
 
+def _quote_group_selected(value: str, group_key: str) -> bool:
+    """组别是否已“选中”成完整选项
+
+    生产实测：el-select 里只敲短号『5175』时 input 是有值的，
+    但并没有选中选项，提交时平台会弹『组或人员请至少录入一项！』。
+    因此只有值里带组名关键字（如『市公司报价组』）才算选中。
+    """
+    v = (value or "").strip()
+    if not v:
+        return False
+    return (not group_key) or (group_key in v)
+
+
+async def _quote_visible_input(scope, placeholder: str):
+    """取 scope 内**可见**的 placeholder 输入框（没有可见的就退回最后一个）
+
+    弹窗重渲染会留下隐藏的旧节点，`.last` 可能取到隐藏节点：
+    读到旧值会让『已自动带出』判断误成立 → 跳过填写 → 平台弹『组或人员请至少录入一项』。
+    """
+    loc = scope.locator(f"input[placeholder='{placeholder}']")
+    n = await loc.count()
+    found = None
+    for i in range(n):
+        el = loc.nth(i)
+        try:
+            if await el.is_visible():
+                found = el
+        except Exception:
+            continue
+    if found is not None:
+        return found
+    return loc.last if n > 0 else None
+
+
+async def _quote_dismiss_group_required_popup(page: Page, timeout: float = 3.0) -> bool:
+    """处理『组或人员请至少录入一项！』提示框：点『确定』关闭，返回是否出现过
+
+    这个提示只是校验失败，点确定即可取消，不会提交任何东西；
+    不清掉它会一直盖在页面上，后续等待提交结果/平级移交都会被挡住。
+
+    生产实测（2026-11-18）弹框 DOM：
+      <div class="el-message-box__wrapper" role="dialog">
+        <div class="el-message-box">
+          <div class="el-message-box__message"><p>组或人员请至少录入一项！</p></div>
+          <div class="el-message-box__btns">
+            <button class="el-button ... el-button--primary"><span>确定</span></button>
+          </div>
+    弹框是异步弹出的，所以这里轮询 timeout 秒，而不是只扫一次。
+    """
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        for fr in page.frames:
+            try:
+                box = fr.locator(".el-message-box:visible").last
+                if await box.count() == 0 or not await box.is_visible():
+                    continue
+                txt = (await box.inner_text() or "").strip()
+                if "请至少录入一项" not in txt:
+                    continue
+                print(f"  [!] 平台提示『{' '.join(txt.split())[:60]}』→ 点『确定』关闭")
+                log_audit("提交上级：出现『组或人员请至少录入一项』提示 → 点确定关闭")
+                for bt in ("确定", "确 定"):
+                    btn = box.locator(
+                        f"button:has-text('{bt}'), .el-button:has-text('{bt}')").first
+                    if await btn.count() == 0 or not await btn.is_visible():
+                        continue
+                    try:
+                        await btn.click(timeout=3000)
+                    except Exception:
+                        await btn.evaluate("el => el.click()")
+                    break
+                try:
+                    await box.wait_for(state="hidden", timeout=3000)
+                except Exception:
+                    pass
+                return True
+            except Exception:
+                continue
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.25)
+
+
+async def _quote_clear_blocking_overlay(page: Page, label: str = "报价任务提交") -> int:
+    """清掉盖在『报价任务提交』弹窗上的 message box
+
+    生产实测（2026-11-18 RDAA2026130700N0068070 / RDAA2026130800N0039714）：
+    选完提交路径『九级报价』后，上层还压着一个 el-message-box__wrapper，
+    Playwright 点组别代码输入框时 15 秒全部被它拦截 → 卡死。
+
+    处理规则（与保险金额提示框一致）：
+      · 报价总额超过保险金额…是否重新报价 → 点『取消』
+      · 请提交远程操作平台处理 → 中止（应走分中心报价分支，不能按九级报价提交）
+      · 其它未知提示 → 记录文案后点『确定/确认/知道了』，仅用于解除遮挡
+    """
+    handled = 0
+    for _ in range(3):
+        box = None
+        for fr in page.frames:
+            try:
+                b = fr.locator(
+                    ".el-message-box__wrapper:visible, .el-message-box:visible").last
+                if await b.count() > 0 and await b.is_visible():
+                    box = b
+                    break
+            except Exception:
+                continue
+        if box is None:
+            break
+
+        try:
+            txt = (await box.inner_text() or "").strip()
+        except Exception:
+            txt = ""
+        flat = "".join(txt.split())
+        print(f"  [!] {label}：发现遮挡弹窗 → {txt[:120] or '（无文本）'}")
+        log_audit(f"{label}：发现遮挡弹窗『{txt[:300]}』")
+
+        if "请提交远程操作平台处理" in flat:
+            raise RuntimeError(
+                f"{label}：弹出『请提交远程操作平台处理』→ 应改走分中心报价分支，"
+                "不能按九级报价继续提交"
+            )
+        if "报价总额超过保险金额" in flat and "是否重新报价" in flat:
+            buttons = ("取消",)
+        else:
+            buttons = ("确定", "确 定", "确认", "确 认", "提交下一节点",
+                       "知道了", "已阅知", "关闭")
+
+        clicked = False
+        for bt in buttons:
+            try:
+                btn = box.locator(
+                    f"button:has-text('{bt}'), .el-button:has-text('{bt}'), "
+                    f"[role='button']:has-text('{bt}'), a:has-text('{bt}')").first
+                if await btn.count() == 0 or not await btn.is_visible():
+                    continue
+                try:
+                    await btn.click(timeout=3000)
+                except Exception:
+                    # 弹窗本身也被浮层挡住时，用 JS 直接触发点击（绕过指针拦截）
+                    await btn.evaluate("el => el.click()")
+                clicked = True
+                print(f"  [✓] {label}：遮挡弹窗 → 点『{bt}』")
+                log_audit(f"{label}：遮挡弹窗点『{bt}』")
+                break
+            except Exception:
+                continue
+        if not clicked:
+            try:
+                x = box.locator(
+                    ".el-message-box__headerbtn, .el-message-box__close").first
+                if await x.count() > 0:
+                    await x.click(timeout=2000)
+                    clicked = True
+                    print(f"  [✓] {label}：遮挡弹窗 → 点右上角关闭")
+            except Exception:
+                pass
+
+        handled += 1
+        try:
+            await box.wait_for(state="hidden", timeout=3000)
+        except Exception:
+            await asyncio.sleep(0.5)
+        if not clicked:
+            break
+    return handled
+
+
 async def _quote_fill_group_remote(
     page: Page,
     group_input: Locator,
@@ -470,6 +639,7 @@ async def _quote_fill_group_remote(
     full_value: str,
     label: str = "组别代码",
     timeout: float = 8.0,
+    dialog: Locator | None = None,
 ) -> None:
     """填写「远程搜索」类型的 el-select（提交上级弹窗里的组别代码就是这种）
 
@@ -496,99 +666,176 @@ async def _quote_fill_group_remote(
 
     不能用 fill(full_value) 的原因：后端可能只按短号/名称前缀匹配，完整值搜不到选项。
     """
-    deadline = time.monotonic() + timeout
+    # Step 0: 先清掉盖住弹窗的 message box
+    #（生产实测：选完『九级报价』后上层压着 el-message-box，点击被拦截 15s 直至超时）
+    await _quote_clear_blocking_overlay(page, label)
+    # 平台可能在选完提交路径后就异步弹『组或人员请至少录入一项』，
+    # 它会盖住组别输入框；这里先廉价探测一次，避免下面的点击白等
+    await _quote_dismiss_group_required_popup(page, timeout=0.1)
+
+    # Step 0.1: 用稳定 placeholder 重新定位输入框
+    #（弹窗重渲染后 data-bot-field 标记会丢，导致 locator 解析不到）
+    try:
+        scope = dialog if dialog is not None else page
+        alt = await _quote_visible_input(scope, "组号或组名")
+        if alt is not None and await alt.count() > 0:
+            group_input = alt
+    except Exception:
+        pass
+
+    # Step 0.2: 关掉可能残留的其它下拉（提交路径选完后弹层可能还开着，会挡住点击）
+    # 用 document mousedown 触发 Element UI 的 click-outside，避免按 Esc 把整个弹窗关掉
+    try:
+        if await page.locator(".el-select-dropdown.el-popper:visible").count() > 0:
+            await page.evaluate(
+                "() => document.body.dispatchEvent("
+                "new MouseEvent('mousedown', {bubbles: true}))")
+            await asyncio.sleep(0.3)
+    except Exception:
+        pass
 
     # Step 1: 点击 input 聚焦
+    # 点击超时压到 1.5s：提示框若在点击瞬间弹出，Playwright 会一直等可点击性，
+    # 旧版 5s 才失败 → 看起来像“程序不处理提示框”。这里失败后立即清遮挡再试。
     try:
-        await safe_click(group_input, f"{label} → 点击聚焦")
+        await group_input.click(timeout=1500)
     except Exception as exc:
-        print(f"  [!] {label} 点击聚焦失败: {exc}")
+        await _quote_dismiss_group_required_popup(page, timeout=0.1)
+        await _quote_clear_blocking_overlay(page, label)
+        try:
+            await group_input.click(timeout=1500)
+        except Exception:
+            try:
+                await group_input.evaluate(
+                    "el => { el.removeAttribute('readonly'); el.focus(); }")
+            except Exception:
+                print(f"  [!] {label} 点击聚焦失败，改用 JS 输入: {exc}")
+
+    # 只读态（已选值/组件锁定）会吞掉键盘输入 → 先解除
+    try:
+        if await group_input.get_attribute("readonly") is not None:
+            await group_input.evaluate("el => el.removeAttribute('readonly')")
+    except Exception:
+        pass
 
     # Step 2: 清空 input + 输入短号关键字（触发远程搜索）
     try:
         await group_input.fill("")
         await asyncio.sleep(0.2)
     except Exception:
-        pass
+        try:
+            await group_input.evaluate(
+                "el => { el.value='';"
+                " el.dispatchEvent(new Event('input',{bubbles:true})); }")
+        except Exception:
+            pass
     # 用 type 逐字输入（比 fill 更像真实用户，remote-method 的防抖通常用 input 事件）
     try:
         await group_input.type(short_query, delay=30)
     except Exception:
         try:
             await group_input.fill(short_query)
-        except Exception as exc:
-            raise RuntimeError(f"{label} 无法输入关键字『{short_query}』: {exc}")
+        except Exception:
+            try:
+                await group_input.evaluate(
+                    "(el, q) => { el.value=q;"
+                    " el.dispatchEvent(new Event('input',{bubbles:true})); }",
+                    short_query)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"{label} 无法输入关键字『{short_query}』: {exc}")
     print(f"  [i] {label} 输入关键字『{short_query}』，等待后端返回选项...")
 
-    # Step 3: 等待 body 根节点下的下拉弹层出现（el-popper 被 teleport 到 body）
-    dropdown_sel = ".el-select-dropdown.el-popper:visible"
-    dropdown = page.locator(dropdown_sel).first
-    try:
-        await dropdown.wait_for(state="visible", timeout=4000)
-    except Exception:
-        # 可能弹层被旧的 dropdown 残留挡住，先清一下再等
-        for _ in range(3):
-            try:
-                await asyncio.sleep(0.5)
-                if await dropdown.count() > 0 and await dropdown.is_visible():
+    # Step 3+4: 轮询所有可见下拉，直到出现含 match_keyword 的选项
+    # 不能用「第一个可见下拉」：提交路径下拉可能残留，会读到它的 8 个选项，
+    # 旧实现据此兜底点第一项，既点不中还会误改提交路径，并空转近 4 分钟。
+    picked_text = ""
+    seen: list[str] = []
+    retyped = False
+    wait_deadline = time.monotonic() + max(timeout, 12.0)
+    while time.monotonic() < wait_deadline and not picked_text:
+        # 提示框可能在等待选项期间弹出并盖住下拉 → 顺手关掉（点确定只是取消校验）
+        await _quote_dismiss_group_required_popup(page, timeout=0.01)
+        seen = []
+        try:
+            drops = page.locator(".el-select-dropdown.el-popper:visible")
+            for di in range(await drops.count()):
+                items = drops.nth(di).locator(".el-select-dropdown__item")
+                for ii in range(await items.count()):
+                    it = items.nth(ii)
+                    try:
+                        if not await it.is_visible():
+                            continue
+                        text = (await it.inner_text()).strip()
+                    except Exception:
+                        continue
+                    if not text:
+                        continue
+                    if text not in seen:
+                        seen.append(text)
+                    if match_keyword and match_keyword in text:
+                        try:
+                            await it.click(timeout=2500)
+                        except Exception:
+                            # 选项可能被其它浮层盖住 → JS 触发，确保真正选中
+                            try:
+                                await it.evaluate("el => el.click()")
+                            except Exception:
+                                break
+                        picked_text = text
+                        break
+                if picked_text:
                     break
-                # 重新 type 一次
+        except Exception:
+            pass
+        if picked_text:
+            break
+
+        # 只重新输入一次，避免反复清空页面状态
+        if not retyped and time.monotonic() > wait_deadline - 8.0:
+            retyped = True
+            try:
+                await group_input.click(timeout=3000)
                 await group_input.press("Control+a")
                 await group_input.press("Backspace")
                 await group_input.type(short_query, delay=30)
+                print(f"  [i] {label} 暂未见到目标选项，重新输入『{short_query}』再试...")
             except Exception:
-                continue
-        try:
-            await dropdown.wait_for(state="visible", timeout=2000)
-        except Exception as exc:
-            raise RuntimeError(
-                f"{label} 输入『{short_query}』后未出现下拉选项"
-                f"（body 根节点无可见的 .el-select-dropdown.el-popper）: {exc}"
-            )
+                pass
+        await asyncio.sleep(0.4)
 
-    # Step 4: 在下拉里找含 match_keyword 的选项并点掉
-    # 下拉弹层在 body 根节点，所以用 page 范围找
-    item_sel = ".el-select-dropdown.el-popper:visible .el-select-dropdown__item"
-    items = page.locator(item_sel)
-    n = await items.count()
-    print(f"  [i] 下拉返回 {n} 个选项，匹配含『{match_keyword}』的项...")
-    picked = False
-    for i in range(n):
-        item = items.nth(i)
+    if picked_text:
+        print(f"  [✓] {label} 下拉选中: {picked_text}")
+        log_audit(f"{label}下拉选中(远程搜索): {picked_text}")
+    else:
+        # 兜底：只点「文本含短号」的选项，绝不点其它下拉（否则会改掉提交路径）
         try:
-            if not await item.is_visible():
-                continue
-            text = (await item.inner_text()).strip()
-            if match_keyword in text:
-                await item.click()
-                picked = True
-                print(f"  [✓] {label} 下拉选中: {text}")
-                log_audit(f"{label}下拉选中(远程搜索): {text}")
-                break
-        except Exception:
-            continue
-
-    if not picked:
-        # 兜底：取第一个非 disabled 且非 empty 的选项
-        for i in range(n):
-            item = items.nth(i)
-            try:
-                if not await item.is_visible():
+            items = page.locator(
+                ".el-select-dropdown.el-popper:visible .el-select-dropdown__item")
+            for i in range(await items.count()):
+                it = items.nth(i)
+                try:
+                    text = (await it.inner_text()).strip()
+                    if short_query and short_query in text:
+                        try:
+                            await it.click(timeout=2500)
+                        except Exception:
+                            await it.evaluate("el => el.click()")
+                        picked_text = text
+                        print(f"  [✓] {label} 兜底选中含『{short_query}』的选项: {text}")
+                        log_audit(f"{label}下拉选中(兜底): {text}")
+                        break
+                except Exception:
                     continue
-                text = (await item.inner_text()).strip()
-                if text:
-                    await item.click()
-                    picked = True
-                    print(f"  [✓] {label} 兜底选中第一个选项: {text}")
-                    log_audit(f"{label}下拉选中(兜底): {text}")
-                    break
-            except Exception:
-                continue
+        except Exception:
+            pass
 
-    if not picked:
+    if not picked_text:
+        print(f"  [!] {label} 当前可见下拉选项({len(seen)}): {seen[:12]}")
+        log_audit(f"{label} 未匹配到选项，可见下拉({len(seen)}): {seen[:12]}")
         raise RuntimeError(
-            f"{label}：下拉弹层已出现但未找到含『{match_keyword}』的选项"
-            f"（共 {n} 项）→ 无法自动填写"
+            f"{label}：未找到含『{match_keyword}』的选项"
+            f"（可见 {len(seen)} 项：{seen[:8]}）→ 无法自动填写"
         )
 
     # Step 5: 等待 input 带上完整值，校验
@@ -610,10 +857,112 @@ async def _quote_fill_group_remote(
     print(f"  [✓] {label} 已带上值: {val}")
     log_audit(f"{label}已填写: {val}")
 
+    # 平台可能在操作期间异步弹『组或人员请至少录入一项』（延迟 0.5~1s），
+    # 留着会挡住后面『提交任务』的点击 → 收尾时再清一次
+    await _quote_dismiss_group_required_popup(page, timeout=0.4)
+
     # 额外校验：如果 full_value 提供了，检查是不是匹配
     if full_value and full_value not in val and match_keyword not in val:
         print(f"  [!] {label} 值校验：期望含『{full_value}』或『{match_keyword}』"
               f"，实际『{val}』— 仍继续，但请人工留意")
+
+
+async def _quote_read_group_value(group_input) -> str:
+    """读取组别代码输入框当前值（兼容 input_value / Element UI 已选项文本）"""
+    try:
+        if group_input is not None and await group_input.count() > 0:
+            val = (await group_input.input_value() or "").strip()
+            if val:
+                return val
+    except Exception:
+        pass
+    try:
+        if group_input is not None and await group_input.count() > 0:
+            val = await group_input.evaluate(
+                "el => (el.value || (el.closest('.el-select')"
+                " && el.closest('.el-select').querySelector("
+                "'.el-select__selected-item, .el-select__placeholder')"
+                " && el.closest('.el-select').querySelector("
+                "'.el-select__selected-item, .el-select__placeholder')"
+                ".innerText) || '')")
+            return (val or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _quote_group_ok(val: str, group_key: str) -> bool:
+    """组别是否真的选中（不只是输入了短号）"""
+    try:
+        return bool(_quote_group_selected(val, group_key))
+    except Exception:
+        return bool(val and group_key and group_key in val)
+
+
+async def _quote_locate_group_input(page: Page, dialog):
+    """用稳定 placeholder 在当前弹窗里重新定位组别输入框"""
+    try:
+        scope = dialog if dialog is not None else page
+        inp = await _quote_visible_input(scope, "组号或组名")
+        if inp is not None and await inp.count() > 0:
+            return inp
+    except Exception:
+        pass
+    return None
+
+
+async def _quote_wait_group_stable(page: Page, dialog, group_key: str,
+                                   timeout: float = 2.5) -> str:
+    """轮询组别输入框：连续 3 次读到“已选中且值不变”才返回最后的值"""
+    deadline = time.monotonic() + max(0.5, timeout)
+    last = ""
+    stable = 0
+    while time.monotonic() < deadline:
+        inp = await _quote_locate_group_input(page, dialog)
+        val = await _quote_read_group_value(inp) if inp is not None else ""
+        if _quote_group_ok(val, group_key) and val == last:
+            stable += 1
+            if stable >= 3:
+                return val
+        else:
+            stable = 0
+        last = val
+        await asyncio.sleep(0.25)
+    return last
+
+
+async def _quote_ensure_group_selected(page: Page, dialog, group_input,
+                                       group_code: str, group_key: str,
+                                       group_option: str):
+    """确保组别已真正选中；返回 (最新输入框, 当前值)
+
+    选提交路径后弹窗会异步重渲染/回填，可能在填完后把组别清空。
+    这里先等自动带出稳定，未带出则远程填写，并做二次重填兜底。
+    """
+    # 先等系统自动带出（同案件走过时可能自动填好）
+    auto_val = await _quote_wait_group_stable(page, dialog, group_key, timeout=4.0)
+    if _quote_group_ok(auto_val, group_key):
+        inp = await _quote_locate_group_input(page, dialog) or group_input
+        return inp, auto_val
+
+    inp, val = group_input, ""
+    for attempt in (1, 2):
+        inp = await _quote_locate_group_input(page, dialog) or group_input
+        await _quote_fill_group_remote(
+            page, inp,
+            short_query=group_code,
+            match_keyword=group_key or group_option,
+            full_value=group_option,
+            label="组别代码",
+            dialog=dialog,
+        )
+        val = await _quote_wait_group_stable(page, dialog, group_key, timeout=2.5)
+        if _quote_group_ok(val, group_key):
+            return inp, val
+        print(f"  [!] 组别填写后仍为空/未选中（第 {attempt} 次，当前『{val or '空'}』）"
+              f"→ 重新填写")
+        log_audit(f"组别填写后未稳定（第 {attempt} 次，当前『{val or '空'}』）→ 重填")
+    return inp, val
 
 
 # ============================================================
@@ -3045,6 +3394,213 @@ async def step_loss_cancel_direct_supply(page: Page, context: dict, **kwargs) ->
     return vehicle, parts
 
 
+_JS_PART_NAME_COLORS = r"""
+() => {
+  const out = [];
+  document.querySelectorAll('span.partName').forEach((el) => {
+    const txt = (el.innerText || el.textContent || '').trim();
+    if (!txt) return;
+    const st = getComputedStyle(el);
+    const r = el.getBoundingClientRect();
+    if (st.display === 'none' || st.visibility === 'hidden' ||
+        parseFloat(st.opacity || '1') === 0 || r.width < 1 || r.height < 1) return;
+    const deco = (st.textDecorationLine || st.textDecoration || '').toLowerCase();
+    const underline = deco.includes('underline') ||
+        (!!st.borderBottomStyle && st.borderBottomStyle !== 'none' &&
+         parseFloat(st.borderBottomWidth || '0') > 0);
+    out.push({name: txt, color: (st.color || '').trim(),
+              partcolor: el.getAttribute('data-partcolor') || '',
+              underline: underline});
+  });
+  return out;
+}
+"""
+
+
+def _parse_rgb(color: str):
+    """把 rgb/rgba/#hex 颜色解析为 (r,g,b)，失败返回 None"""
+    c = (color or "").strip().lower()
+    m = re.match(r"rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})", c)
+    if m:
+        return tuple(int(x) for x in m.groups())
+    m = re.fullmatch(r"#([0-9a-f]{3}|[0-9a-f]{6})([0-9a-f]{2})?", c)
+    if m:
+        h = m.group(1)
+        if len(h) == 3:
+            h = "".join(ch * 2 for ch in h)
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return None
+
+
+def _norm_color(color: str) -> str:
+    rgb = _parse_rgb(color)
+    return f"rgb({rgb[0]},{rgb[1]},{rgb[2]})" if rgb else (color or "").strip().lower()
+
+
+def _is_black_color(color: str) -> bool:
+    """getComputedStyle 的颜色是否黑色（rgb(0,0,0) / rgba(0,0,0,x) / #000）"""
+    rgb = _parse_rgb(color)
+    return bool(rgb and all(x <= 16 for x in rgb))
+
+
+def _is_blue_color(color: str) -> bool:
+    """蓝色系：蓝色通道明显高于红/绿（如 rgb(28,97,252)）"""
+    rgb = _parse_rgb(color)
+    if not rgb:
+        return False
+    r, g, b = rgb
+    return b >= 120 and b - max(r, g) >= 40
+
+
+def _is_orange_color(color: str) -> bool:
+    """橙色系：红 > 绿 > 蓝，且红/绿都较高（如 rgb(255,153,0)）"""
+    rgb = _parse_rgb(color)
+    if not rgb:
+        return False
+    r, g, b = rgb
+    return r >= 180 and 70 <= g <= 210 and b <= 130 and r >= g and g >= b
+
+
+def _part_name_should_skip(row: dict) -> tuple[bool, str]:
+    """判断一个零件名称颜色是否需要人工处理
+
+    规则：
+      1) 橙色带下划线 → 视同黑色，正常处理
+      2) 配置了精确跳过颜色 → 只按该清单跳过
+      3) 未配置 → 内置启发式：蓝色、无下划线的橙色
+    """
+    color = str(row.get("color") or "")
+    underline = bool(row.get("underline"))
+    if underline and getattr(cfg, "PART_NAME_UNDERLINE_AS_BLACK", True):
+        return False, "下划线视同黑色"
+    if _is_black_color(color):
+        return False, "黑色"
+
+    configured = tuple(getattr(cfg, "PART_NAME_SKIP_COLORS", ()) or ())
+    if configured:
+        skip_set = {_norm_color(c) for c in configured}
+        if _norm_color(color) in skip_set:
+            return True, "配置颜色"
+        return False, "未列入跳过颜色"
+
+    if _is_blue_color(color):
+        return True, "蓝色"
+    if _is_orange_color(color):
+        return True, "橙色无下划线"
+    return False, "其他颜色"
+
+
+async def _detect_non_black_part_names(scope, context: dict, prefer=None) -> None:
+    """定损平台换件列表：任一『零件名称』字体颜色不是黑色 → 标记该报案号跳过自动处理
+
+    scope 传 Page 时自动挑 frame：优先含本单报案号的，其次 prefer（已定位到的零件表 frame），
+    避免残留的上一单文档误触发跳过。
+    """
+    frames = getattr(scope, "frames", None) or [scope]
+    cur = (context.get("claim_no") or "").strip().upper()
+    # 曾因蓝色/纯橙色退回过的报案号：二次进入时默认资料已补齐，颜色这一项视同正常
+    color_returned_before = False
+    if cur:
+        try:
+            from bot.pricing import get_price_service
+            color_returned_before = get_price_service().claim_color_returned_before(cur)
+        except Exception:
+            color_returned_before = False
+    cands = []
+    for fr in frames:
+        try:
+            rows = await fr.evaluate(_JS_PART_NAME_COLORS)
+        except Exception:
+            continue
+        if not rows:
+            continue
+        hit = False
+        if cur:
+            try:
+                txt = (await fr.evaluate(
+                    "() => document.body ? document.body.innerText : ''")) or ""
+                hit = cur in txt.upper()
+            except Exception:
+                hit = False
+        cands.append((rows, hit, fr is prefer))
+    if not cands:
+        return
+    rows = next((r for r, hit, _ in cands if hit),
+                next((r for r, _, pf in cands if pf), cands[0][0]))
+    if not rows:
+        return
+    decisions = []
+    for r in rows:
+        skip, why = _part_name_should_skip(r)
+        color = str(r.get("color") or "")
+        if (skip and color_returned_before
+                and (_is_blue_color(color) or _is_orange_color(color))):
+            skip, why = False, "上次已退回，本次视同正常"
+        decisions.append((r, skip, why))
+    bad_rows = [(r, why) for r, skip, why in decisions if skip]
+    bad = [r for r, _ in bad_rows]
+
+    # 蓝色 / 纯橙色 → STEP 9 选业务动作『退回』；其他颜色（如配置的特殊颜色）仍按跳过处理
+    blue_rows: list = []
+    orange_rows: list = []
+    other_rows: list = []
+    for r in bad:
+        color = str(r.get("color") or "")
+        if _is_blue_color(color):
+            blue_rows.append(r)
+        elif _is_orange_color(color):
+            orange_rows.append(r)
+        else:
+            other_rows.append(r)
+
+    for key in ("skip_part_color", "skip_part_color_parts",
+                "return_part_color", "return_blue_parts", "return_orange_parts"):
+        context.pop(key, None)
+
+    # 无论是否跳过都打印颜色分布，便于现场收集需要跳过的字体颜色代码
+    dist: dict = {}
+    for r, skip, why in decisions:
+        key = f"{r.get('color') or '未知'}{'（下划线）' if r.get('underline') else ''}"
+        item = dist.setdefault(key, {"n": 0, "label": "跳过" if skip else "正常",
+                                     "why": why})
+        item["n"] += 1
+    summary = "；".join(
+        f"{k}×{v['n']}→{v['label']}({v['why']})"
+        for k, v in sorted(dist.items(), key=lambda kv: -kv[1]["n"]))
+    print(f"  [i] 零件名称颜色分布（{len(rows)} 个）：{summary}")
+    log_audit(f"零件名称颜色分布：{summary}")
+
+    if color_returned_before:
+        print("  [i] 该报案号曾因蓝色/纯橙色退回 → 本次零件名称颜色视同正常，"
+              "按一般案件处理")
+        log_audit(f"报案号={cur} 曾因颜色退回 → 二次进入视同正常")
+
+    if not bad:
+        print(f"  [i] 零件名称颜色检查：{len(rows)} 个均无需跳过 → 正常自动处理")
+        return
+    if other_rows:
+        context["skip_part_color"] = True
+    if blue_rows or orange_rows:
+        context["return_part_color"] = True
+        context["return_blue_parts"] = blue_rows[:10]
+        context["return_orange_parts"] = orange_rows[:10]
+    context["skip_part_color_parts"] = bad[:10]
+    sample = "、".join(
+        f"{r.get('name')}（{r.get('color')}"
+        f"{'，下划线' if r.get('underline') else ''}，{why}）"
+        for r, why in bad_rows[:5])
+    action = ("STEP 9 选业务动作『退回』"
+              if context.get("return_part_color") else "STEP 9 前跳过『报价完成』")
+    print(f"\n  ⏭ 检测到 {len(bad)}/{len(rows)} 个零件名称颜色需人工处理"
+          f" → 正常执行到 STEP 8，{action}")
+    if context.get("return_part_color"):
+        print(f"     蓝色 {len(blue_rows)} 个 / 纯橙色 {len(orange_rows)} 个 → 退回并填写意见")
+    if other_rows:
+        print(f"     其他颜色 {len(other_rows)} 个 → STEP 9 前跳过")
+    print(f"      {sample}")
+    log_audit(f"零件名称颜色需人工处理 {len(bad)}/{len(rows)} → {action}：{sample}")
+
+
 @register_step(desc="定损平台提取 VIN + 所有换件信息", outputs=["vehicle", "parts"])
 async def step_loss_extract_data(page: Page, context: dict, **kwargs) -> tuple:
     print(f"\n🔹 STEP 4: 定损平台 → 提取 VIN 和换件列表")
@@ -3267,6 +3823,11 @@ async def step_loss_extract_data(page: Page, context: dict, **kwargs) -> tuple:
         data_lossobj_parts = _picked[1]
         print(f"  [diag] data-lossobj 方案 → frame={(_picked[0].url or 'main')[:50]} "
               f"→ 拿到 {len(data_lossobj_parts)} 条 JSON")
+
+    # ★ 换件列表『零件名称』字体颜色非黑色 → 标记跳过
+    #   （独立于 data-lossobj 是否解析成功，直接看 span.partName 的 computed color）
+    await _detect_non_black_part_names(page, context,
+                                       prefer=(_picked[0] if _picked else None))
 
     if data_lossobj_parts and len(data_lossobj_parts) > 0 and not data_lossobj_parts[0].get("__parseError"):
         print(f"  [i] 使用 data-lossobj JSON 方案提取零件 ({len(data_lossobj_parts)} 条)")
@@ -4877,25 +5438,75 @@ def _need_resync_after_fix_failure(context: dict) -> None:
 
 
 # ============================================================
+def _quote_fix_part_key(part) -> str:
+    """与改价历史表一致的零件键；无编码时退回落损单内序号"""
+    code = (part.code or "").strip().upper()
+    return code or f"#{int(part.index or 0):02d}"
+
+
 @register_step(desc="自动修复超市场价零件报价列 + 点暂存", inputs=["parts"], outputs=["fixed_count"])
 async def step_loss_fix_over_market(page: Page, context: dict, **kwargs) -> int:
     parts = kwargs.get("parts") or context.get("parts") or []
     """
     STEP 7: 定损平台 → 自动修复超市场价零件「报价」列 + 点暂存
     公式: 报价 = 一车一件价 × (定损价 / 本地价)，保留整数
-    注意: 本地价只读不改，只能改报价列
-    返回修复了多少个。本步骤不抛异常（改价失败只记录，流程继续往下走）
+    注意: 本地价只读不改，只能改报价列；同一报案已改成功的零件不再重复修改
+    返回本次实际修复了多少个。本步骤不抛异常（改价失败只记录，流程继续往下走）
     """
-    over = [p for p in parts if p.within_market is False and p.suggested_fixed_price is not None]
+    over = [p for p in parts if p.within_market is False]
     if not over:
         print(f"\n🔹 STEP 7: 无超市场价零件，跳过修复")
         return 0
 
-    print(f"\n🔹 STEP 7: 自动修复 {len(over)} 个超市场价零件的报价列")
+    claim_no = (context.get("claim_no") or "").strip().upper()
+    history_error = ""
+    try:
+        from bot.pricing import get_price_service
+        price_svc = get_price_service()
+        history = price_svc.get_claim_quote_fixes(claim_no)
+    except Exception as exc:
+        history = None
+        history_error = f"{type(exc).__name__}: {str(exc).splitlines()[0][:160]}"
+    if history is None:
+        # 没有可靠的幂等记录时继续改价可能让报价越来越低，宁可暂停自动修改。
+        print(f"\n  ⚠️ 改价历史不可用（{history_error or '数据库读取失败'}）"
+              f" → 本报案暂停自动改价，避免重复下调")
+        log_audit(f"改价历史不可用，暂停自动改价 | 报案号={claim_no} | {history_error}")
+        for p in over:
+            p.fixed_price = None
+        _need_resync_after_fix_failure(context)
+        return 0
+
+    # 先查历史，再决定是否计算公式；历史零件完全不进入本轮改价。
+    candidates = []
+    history_fixed = []
+    for p in over:
+        part_key = _quote_fix_part_key(p)
+        previous = history.get(part_key)
+        if previous is not None:
+            # 历史零件本轮不再写页面、也不再计入“本单改过报价”，
+            # 以免没有新变化时仍被强制走『车辆定损』造成重复同步。
+            p.fixed_price = None
+            history_fixed.append(p)
+            print(f"  ⏭ #{p.index:02d} {part_key}: 本报案此前已改价"
+                  f"（{previous.get('fixed_at') or '历史记录'}）→ 本次不再修改")
+            log_audit(f"历史已改价，本次跳过 | 报案号={claim_no} | 零件={part_key} "
+                      f"首次改价={previous.get('fixed_at') or ''}")
+        elif p.suggested_fixed_price is not None:
+            candidates.append(p)
+
+    if not candidates:
+        print(f"\n🔹 STEP 7: 无需本次改价"
+              + (f"，历史已改价跳过 {len(history_fixed)} 个零件" if history_fixed else ""))
+        return 0
+
+    print(f"\n🔹 STEP 7: 自动修复 {len(candidates)} 个超市场价零件的报价列")
     fixed_count = 0
     failed = []
     skipped = []
-    for p in over:
+    for pos, p in enumerate(candidates):
+        part_key = _quote_fix_part_key(p)
+
         new_price = p.suggested_fixed_price
         # 护栏：新报价必须低于平台原报价（报价=定损价，折率<1 时公式结果必然更低）。
         # 若算出来不低于原报价，说明取到的基准价不对，硬写会被平台重算回去，直接跳过。
@@ -4924,12 +5535,23 @@ async def step_loss_fix_over_market(page: Page, context: dict, **kwargs) -> int:
             ok = False
         if ok:
             fixed_count += 1
+            if not price_svc.record_claim_quote_fix(
+                    claim_no, part_key, new_price, part_name=p.name):
+                print(f"      ⚠️ {part_key} 改价成功但历史记录写入失败 → 后续零件暂停自动改价")
+                log_audit(f"改价历史写入失败，停止后续改价 | 报案号={claim_no} | 零件={part_key}")
+                for rest in candidates[pos + 1:]:
+                    rest.fixed_price = None
+                failed.extend(candidates[pos + 1:])
+                break
         else:
             p.fixed_price = None
             failed.append(p)
         await human_delay()
 
-    print(f"  [✓] 改价成功 {fixed_count}/{len(over)} 个零件")
+    new_candidates = len(candidates)
+    print(f"  [✓] 本次改价成功 {fixed_count}/{new_candidates} 个零件")
+    if history_fixed:
+        print(f"  ⏭ 历史已改价跳过 {len(history_fixed)} 个零件（未重复修改）")
     if skipped:
         for p in skipped:
             print(f"      - 无需下调: #{p.index:02d} {p.code} 平台原报价 ¥{p.list_price}")
@@ -6229,8 +6851,9 @@ _JS_QUICK_LINK_PROCESS = """
 async def _quote_click_quick_process(page: Page) -> Optional[Page]:
     """提交上级后的『系统提示』弹窗 → 快速链接专栏 → 点『处理』
 
-    二次处理的报案号（已提过上级）会弹「工作流提交成功」提示，下方快速链接专栏里
-    有『处理』按钮：点了就回到本人的报价处理页（九级报价环节），可直接报价完成。
+    之前本工号处理过的报案号，提交上级后会弹「工作流提交成功」提示，
+    下方快速链接专栏里有『处理』按钮：点了就回到本人的报价处理页（九级报价环节），
+    可直接报价完成，不需要再走平级移交。
     """
     info = None
     try:
@@ -6272,6 +6895,7 @@ async def step_quote_finalize(page: Page, context: dict, **kwargs) -> None:
     print(f"\n🔹 STEP 9: 报价处理 → 报价完成 → 提交任务")
     from bot.config import SELECTORS_PORTAL as SP
 
+    claim_no = context.get("claim_no", "")
     # 二次处理后经『快速链接 → 处理』回到报价页：后续提交路径保持系统默认
     after_quick_process = False
 
@@ -6287,20 +6911,38 @@ async def step_quote_finalize(page: Page, context: dict, **kwargs) -> None:
             print(f"  💰 报价汇总『换件金额』¥{amount:,.2f} > ¥{threshold:,.0f}"
                   f"（当前任务环节={stage or '未读到'}）→ 业务动作『提交上级』")
             log_audit(f"换件金额 ¥{amount:.2f} 超 ¥{threshold:g} → 提交上级（九级报价）")
-            await step_quote_submit_superior(page, context, **_transfer_kwargs(kwargs))
+            # 先标记，确保本处理轮次内失败也不会在兜底里再次提交上级
             context["high_amount_transferred"] = True
-            if context.get("reprocess"):
-                # 二次处理：提交上级后弹「工作流提交成功」提示，点快速链接专栏『处理』
-                # 直接回到本人的报价页（九级报价环节）→ 业务动作改『报价完成』继续提交，
-                # 不需要再走平级移交（那是首轮的路径）
+            await step_quote_submit_superior(page, context, **_transfer_kwargs(kwargs))
+
+            # 分中心例外：单件换件 >5 万，已继续提交上级到分中心报价 → 本环节结束
+            if context.get("branch_center_done"):
+                print("  ✅ 已继续提交上级到分中心报价 → 本环节结束（不平级移交）")
+                return
+
+            # 第一次提交上级成功后决定收回路径：
+            #   之前本工号处理过 → 快速链接『处理』→ 当前页报价完成
+            #   首次接收         → 平级移交回本工号后再报价完成
+            seen = context.get("claim_seen_before")
+            if seen is None:
+                try:
+                    from bot.pricing import get_price_service
+                    seen = get_price_service().claim_processed_before(claim_no)
+                except Exception:
+                    seen = False
+                context["claim_seen_before"] = seen
+
+            if seen:
+                print(f"  [i] {claim_no} 之前本工号处理过 → 尝试快速链接『处理』")
                 new_page = await _quote_click_quick_process(page)
                 if new_page is None:
-                    print("  [!] 未点到快速链接『处理』→ 回退：按首轮路径平级移交后再处理")
+                    print("  [!] 未点到快速链接『处理』→ 回退：平级移交回本人后再处理")
                     log_audit("二次处理未点开快速链接『处理』→ 回退平级移交")
                     context["transfer_back_needed"] = True
                     return
                 page = new_page
                 context["quote_page"] = page
+                context["quick_process_done"] = True
                 after_quick_process = True
                 try:
                     await page.bring_to_front()
@@ -6310,6 +6952,7 @@ async def step_quote_finalize(page: Page, context: dict, **kwargs) -> None:
                 await asyncio.sleep(1.0)
                 print("  🔁 已在九级报价环节 → 业务动作改『报价完成』继续提交")
             else:
+                print(f"  [i] {claim_no} 首次接收 → 提交上级后走平级移交回本工号")
                 context["transfer_back_needed"] = True
                 return
 
@@ -6557,6 +7200,326 @@ async def _quote_pick_biz_action(page: Page, label_text: str) -> None:
 
 
 # ============================================================
+# STEP 9R：零件名称蓝色 / 纯橙色 → 业务动作「退回」→ 意见 → 评分 → 提交任务
+# ============================================================
+RETURN_OPINION_BLUE = "建议蓝色字体配件补传带VIN匹配的EPC截图或其他价格依据，并核实厂家指导价"
+RETURN_OPINION_ORANGE = "橙色字体配件请用“标准点选方式添加”修改为橙色带下划线字体配件"
+
+
+def return_opinion_text(context: dict) -> str:
+    """蓝色 / 纯橙色零件对应的退回意见（两类同时存在时合并）"""
+    lines = []
+    if context.get("return_blue_parts"):
+        lines.append(RETURN_OPINION_BLUE)
+    if context.get("return_orange_parts"):
+        lines.append(RETURN_OPINION_ORANGE)
+    return "；".join(lines) if lines else RETURN_OPINION_BLUE
+
+
+async def _return_wait_box_with(pages, keywords, timeout: float = 10.0):
+    """在若干页面里等待包含任一关键字的可见弹窗，返回其 locator；超时返回 None"""
+    if isinstance(keywords, str):
+        keywords = (keywords,)
+    sources = list(dict.fromkeys([p for p in pages if p is not None and not p.is_closed()]))
+    deadline = time.monotonic() + max(0.0, timeout)
+    sels = (".el-message-box:visible", ".el-message-box__wrapper:visible",
+            ".el-dialog:visible", "[role='dialog']:visible", ".modal:visible")
+    while True:
+        for pg in sources:
+            if pg.is_closed():
+                continue
+            try:
+                frames = list(pg.frames)
+            except Exception:
+                continue
+            for fr in frames:
+                for sel in sels:
+                    try:
+                        box = fr.locator(sel).last
+                        if await box.count() == 0 or not await box.is_visible():
+                            continue
+                        flat = "".join((await box.inner_text(timeout=1000) or "").split())
+                        if any(k in flat for k in keywords):
+                            return box
+                    except Exception:
+                        continue
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(0.3)
+
+
+async def _return_click_box_btn(box, labels=("确定", "确 定", "确认")) -> bool:
+    """点弹窗里的指定按钮（默认『确定』），失败用 JS 兜底"""
+    for text in labels:
+        for sel in (f"button:has-text('{text}')", f".el-button:has-text('{text}')"):
+            try:
+                btn = box.locator(sel).last
+                if await btn.count() > 0 and await btn.is_visible():
+                    await btn.click(timeout=4000)
+                    print(f"  [✓] 提示框 → 点『{text}』")
+                    return True
+            except Exception:
+                continue
+    try:
+        clicked = await box.evaluate(
+            """(el) => {
+              const btns = Array.from(el.querySelectorAll('button'));
+              const b = btns.find(x => (x.innerText || '').replace(/\\s/g, '').indexOf('确定') >= 0);
+              if (!b) return false;
+              b.click();
+              return true;
+            }""")
+        return bool(clicked)
+    except Exception:
+        return False
+
+
+async def _return_wait_eval_page(quote_page: Page, timeout: float = 15.0):
+    """等待『案件质量评价』页打开（新标签页 / 同页跳转）"""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        for pg in quote_page.context.pages:
+            try:
+                if pg.is_closed():
+                    continue
+                if "/evaluation/" in (pg.url or ""):
+                    return pg
+            except Exception:
+                continue
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(0.3)
+
+
+async def _return_fill_opinion(page: Page, text: str) -> None:
+    """在『意见录入』文本框填写退回意见（Element UI textarea）"""
+    sels = [
+        "form textarea.el-textarea__inner[placeholder*='请输入']",
+        "form textarea.el-textarea__inner",
+        ".quote-opinion textarea, #quote-opinion-section textarea",
+        SELECTORS_PORTAL["quote_opinion_input"],
+        "textarea.el-textarea__inner",
+    ]
+    for sel in sels:
+        for fr in page.frames:
+            try:
+                ta = fr.locator(sel).first
+                if await ta.count() == 0 or not await ta.is_visible():
+                    continue
+                await ta.scroll_into_view_if_needed(timeout=3000)
+                await ta.click(timeout=4000)
+                try:
+                    await ta.fill("", timeout=3000)
+                except Exception:
+                    pass
+                await ta.fill(text, timeout=5000)
+                val = await ta.input_value(timeout=2000)
+                if text[:6] not in (val or ""):
+                    # Vue 双向绑定兜底
+                    await ta.evaluate(
+                        """(el, v) => {
+                          el.value = v;
+                          el.dispatchEvent(new Event('input', {bubbles: true}));
+                          el.dispatchEvent(new Event('change', {bubbles: true}));
+                        }""", text)
+                    val = await ta.input_value(timeout=2000)
+                print(f"  [✓] 退回意见已填写（{sel[:46]}）")
+                log_audit(f"退回意见填写：{val[:160]}")
+                return
+            except Exception:
+                continue
+    raise RuntimeError("报价页未找到『意见录入』输入框 → 无法填写退回意见")
+
+
+_JS_EVAL_PICK_LAST = r"""
+() => {
+  const vis = (el) => {
+    if (!el) return false;
+    const s = getComputedStyle(el);
+    const r = el.getBoundingClientRect();
+    return s.display !== 'none' && s.visibility !== 'hidden' &&
+           parseFloat(s.opacity || '1') > 0 && r.width > 0 && r.height > 0;
+  };
+  let labels = Array.from(document.querySelectorAll('label.el-checkbox')).filter(vis);
+  if (!labels.length) labels = Array.from(document.querySelectorAll('label')).filter(vis);
+  if (!labels.length) return {ok: false, reason: '未找到可勾选项'};
+  let target = labels.find(l => (l.innerText || '').indexOf('存在其他问题需退回') >= 0);
+  const byKeyword = !!target;
+  if (!target) target = labels[labels.length - 1];
+  const inp = target.querySelector('input[type="checkbox"]');
+  if (inp && inp.checked) {
+    return {ok: true, already: true, by_keyword: byKeyword,
+            text: (target.innerText || '').trim().slice(0, 60)};
+  }
+  target.click();
+  const after = target.querySelector('input[type="checkbox"]');
+  return {ok: true, checked: after ? !!after.checked : null, by_keyword: byKeyword,
+          text: (target.innerText || '').trim().slice(0, 60)};
+}
+"""
+
+
+async def _return_pick_eval_last_item(eval_page: Page) -> None:
+    """评价页勾选最后一项（优先『存在其他问题需退回』的可见复选框）"""
+    for fr in eval_page.frames:
+        try:
+            info = await fr.evaluate(_JS_EVAL_PICK_LAST)
+        except Exception:
+            continue
+        if info and info.get("ok"):
+            print(f"  [✓] 评价页勾选：{info.get('text')}"
+                  f"（关键字匹配={info.get('by_keyword')}）")
+            log_audit(f"评价页勾选评价项：{info.get('text')}")
+            return
+    raise RuntimeError("评价页未找到可勾选的评价项（需至少选择一项才能提交）")
+
+
+@register_step(desc="零件名称蓝色/纯橙色 → 业务动作『退回』→ 填意见 → 评分 → 提交任务",
+               inputs=["claim_no"], outputs=["return_part_color"])
+async def step_quote_return_for_color_parts(page: Page, context: dict, **kwargs) -> None:
+    from bot.config import SELECTORS_PORTAL as SP
+
+    claim_no = context.get("claim_no", "")
+    blue = context.get("return_blue_parts") or []
+    orange = context.get("return_orange_parts") or []
+    opinion = return_opinion_text(context)
+    print(f"\n🔹 STEP 9R: 报价页 → 业务动作『退回』（报案号 {claim_no}）")
+    print(f"  蓝色零件: {'、'.join(str(p.get('name')) for p in blue[:5]) or '无'}")
+    print(f"  橙色零件: {'、'.join(str(p.get('name')) for p in orange[:5]) or '无'}")
+    print(f"  退回意见: {opinion}")
+    log_audit(f"零件名称蓝色/纯橙色 → 退回 | 报案号={claim_no} | 意见={opinion}")
+
+    quote_page = context.get("quote_page") or page
+    await quote_page.bring_to_front()
+    if not quote_page.is_closed():
+        page = quote_page
+
+    # 1) 业务动作 → 退回
+    await _quote_pick_biz_action(page, SP["quote_biz_back_text"])
+
+    # 2) 意见录入
+    await _return_fill_opinion(page, opinion)
+
+    # 3) 提交 → 提示『请至少完成一次评分』→ 确定 → 打开评价页
+    _, submit_btn = await find_clickable(
+        page, QUOTE_SUBMIT_SELECTORS, ["提交", "提交任务"],
+        "报价处理 → 提交按钮（退回）", timeout=15000)
+    await safe_click(submit_btn, "报价处理 → 提交按钮（退回）")
+    await human_delay()
+
+    eval_page = None
+    box = await _return_wait_box_with([page], ("评分", "评价"), timeout=10.0)
+    if box is not None:
+        print("  [i] 弹出『请至少完成一次评分』提示 → 点『确定』进入评价页")
+        try:
+            async with page.context.expect_page(timeout=15000) as pinfo:
+                await _return_click_box_btn(box)
+            eval_page = await pinfo.value
+        except Exception:
+            await _return_click_box_btn(box)
+    if eval_page is None or eval_page.is_closed():
+        eval_page = await _return_wait_eval_page(page, timeout=15.0)
+    if eval_page is None or eval_page.is_closed():
+        raise RuntimeError("退回提交后未进入『案件质量评价』页 → 中断")
+    context["evaluation_page"] = eval_page
+    try:
+        await eval_page.bring_to_front()
+        await eval_page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+    await asyncio.sleep(1.0)
+
+    # 4) 评价页：勾选最后一项 → 提交
+    await _return_pick_eval_last_item(eval_page)
+    await human_delay()
+    try:
+        _, eval_submit = await find_clickable(
+            eval_page, QUOTE_SUBMIT_SELECTORS, ["提交"],
+            "评价页 → 提交按钮", timeout=15000)
+        await safe_click(eval_submit, "评价页 → 提交按钮")
+    except RuntimeError as exc:
+        raise RuntimeError(f"评价页未找到『提交』按钮：{exc}")
+    await human_delay()
+
+    # 5) 『保存成功！是否要关闭当前页？』→ 确定 → 评价页关闭
+    box = await _return_wait_box_with([eval_page], "保存成功", timeout=10.0)
+    if box is not None:
+        try:
+            async with eval_page.expect_close(timeout=10000):
+                await _return_click_box_btn(box)
+        except Exception:
+            await _return_click_box_btn(box)
+        await asyncio.sleep(0.8)
+    try:
+        if not eval_page.is_closed():
+            await eval_page.close()
+    except Exception:
+        pass
+
+    # 6) 回到报价页再次提交 → 『报价任务提交』→ 提交任务
+    quote_page = context.get("quote_page") or page
+    try:
+        if quote_page.is_closed():
+            cands = [p for p in page.context.pages
+                     if not p.is_closed() and "/quote/" in (p.url or "")]
+            quote_page = cands[-1] if cands else page
+    except Exception:
+        pass
+    context["quote_page"] = quote_page
+    await quote_page.bring_to_front()
+    await asyncio.sleep(0.8)
+
+    _, submit_btn2 = await find_clickable(
+        quote_page, QUOTE_SUBMIT_SELECTORS, ["提交", "提交任务"],
+        "报价处理 → 提交按钮（退回·二次提交）", timeout=15000)
+    await safe_click(submit_btn2, "报价处理 → 提交按钮（退回·二次提交）")
+    await human_delay()
+    await handle_insurance_amount_dialogs(quote_page, timeout=3.0)
+
+    dialog = None
+    deadline = time.monotonic() + 20.0
+    while time.monotonic() < deadline:
+        dialog = await _quote_wait_submit_dialog(quote_page, timeout=0.5)
+        if dialog is not None:
+            break
+        # 二次提交后可能先弹一个无标题确认框（close_alert），点掉后才是提交弹窗
+        if await confirm_dialog(quote_page, timeout=0.5):
+            await asyncio.sleep(0.8)
+            continue
+        await asyncio.sleep(0.4)
+    if dialog is None:
+        raise RuntimeError("退回流程：二次提交后未弹出『报价任务提交』对话框")
+    print("  [✓] 报价任务提交对话框已弹出（退回）")
+
+    await _quote_click_submit_task(quote_page, dialog)
+    try:
+        await dialog.wait_for(state="hidden", timeout=8000)
+    except Exception:
+        pass
+    await _wait_page_result(
+        quote_page,
+        success_keywords=["工作流提交成功", "提交成功", "操作成功"],
+        timeout=DEFAULT_TIMEOUT,
+        strict=False,
+        label="退回提交",
+    )
+    await asyncio.sleep(0.8)
+    try:
+        await dismiss_all_modals(quote_page, max_rounds=2, per_timeout=2.0)
+    except Exception:
+        pass
+    print("  🎉 零件名称蓝色/纯橙色 → 退回流程已提交")
+    # 记录退回历史：该报案号二次进入时默认资料已补齐，颜色视同正常
+    try:
+        from bot.pricing import get_price_service
+        note = f"blue={len(blue)};orange={len(orange)}"
+        if not get_price_service().mark_claim_color_returned(claim_no, note=note):
+            print("  ⚠️ 退回历史写入失败（不影响本次提交）")
+    except Exception as exc:
+        print(f"  ⚠️ 退回历史写入异常: {type(exc).__name__}")
+
+
+# ============================================================
 # 补救分支 1：报价页 → 业务动作「提交上级」→ 意见「权限不够，报上级审核」→ 提交
 # ============================================================
 SUPERIOR_OPINION = "权限不够，报上级审核"
@@ -6683,6 +7646,8 @@ async def step_quote_submit_superior(page: Page, context: dict, **kwargs) -> dic
         group_code = TRANSFER_GROUP_CODE_BRANCH
         group_key = TRANSFER_GROUP_OPTION_KEY_BRANCH
         group_exclude = ""
+        # 分中心例外：本次处理已经继续提交到分中心报价 → 本环节结束，不再平级移交
+        context["branch_center_done"] = True
         # 分中心分支路径通常已默认选中，跳过 4.1 的选路径步骤（只填组别代码即可）
 
     # 4) 「报价任务提交」弹窗：提交路径=九级报价，组别代码=5175 → 市公司报价组 → 提交任务
@@ -6710,31 +7675,32 @@ async def step_quote_submit_superior(page: Page, context: dict, **kwargs) -> dic
             "（下拉是长列表，需滚到底精确点击）→ 中断，避免用错误路径提交上级"
         )
 
-    # 4.2 组别代码控件（按 label 精确匹配，避免点到同一行里的『提交路径』输入框）
-    group_input = await _quote_field_scope(page, ("组别代码", "组别"))
-    if group_input is not None:
-        _gi = group_input.locator("input").first
-        group_input = _gi if await _gi.count() > 0 else group_input
-    else:
-        group_input = page.locator(SELECTORS_PORTAL["quote_task_group_input"]).first
+    # 4.2 组别代码控件
+    #    优先用稳定 placeholder 定位：弹窗重渲染后 data-bot-field 标记会丢，
+    #    生产实测因此出现 input 解析不到、点击空转 15s 的情况。
+    await _quote_clear_blocking_overlay(page, "组别代码")
+    try:
+        await _wait_no_loading(page, 3.0)
+    except Exception:
+        pass
+    group_input = await _quote_visible_input(dialog, "组号或组名")
+    if group_input is None or await group_input.count() == 0:
+        group_input = await _quote_field_scope(page, ("组别代码", "组别"))
+        if group_input is not None:
+            _gi = group_input.locator("input").first
+            group_input = _gi if await _gi.count() > 0 else group_input
+        else:
+            group_input = page.locator(SELECTORS_PORTAL["quote_task_group_input"]).first
     if await group_input.count() == 0:
         raise RuntimeError(
             "未找到『组别代码』控件（选择器待真机确认："
             f"{SELECTORS_PORTAL['quote_task_group_input']} 或 label=组别代码）"
         )
 
-    # 4.2.1 选完提交路径后，系统可能自动带出组别代码 + 人员代码
-    #       （同案件之前走过时就会自动带出，如：市公司报价组 / 胡晨光）
-    #       → 已带出就直接提交任务，不再重复填写/清空
-    group_val = ""
-    for _ in range(6):                   # 最多等 ~1.5s（足够系统带出）
-        try:
-            group_val = (await group_input.input_value() or "").strip()
-        except Exception:
-            group_val = ""
-        if group_val:
-            break
-        await asyncio.sleep(0.25)
+    # 4.2.1 选完提交路径后，系统可能自动带出组别代码；弹窗也可能异步重渲染。
+    #       → 先等自动带出稳定，未带出再远程填写，并做二次重填兜底。
+    group_input, group_val = await _quote_ensure_group_selected(
+        page, dialog, group_input, group_code, group_key, group_option)
 
     staff_input = await _quote_field_scope(page, ("人员代码", "人员"))
     if staff_input is not None:
@@ -6743,47 +7709,35 @@ async def step_quote_submit_superior(page: Page, context: dict, **kwargs) -> dic
     else:
         staff_input = page.locator(SELECTORS_PORTAL["quote_task_staff_input"]).first
 
-    if group_val:
-        staff_val = ""
-        try:
-            if await staff_input.count() > 0:
-                staff_val = (await staff_input.input_value() or "").strip()
-        except Exception:
-            pass
-        print(f"  [✓] 组别代码已自动带出：{group_val}"
-              f"（人员代码：{staff_val or '—'}）→ 跳过填写")
-        log_audit(f"组别自动带出：{group_val} | 人员：{staff_val or '—'}")
-    else:
-        # 4.2.2 未自动带出 → 远程搜索 el-select（必须输短号触发后端搜索）
-        await _quote_fill_group_remote(
-            page, group_input,
-            short_query=group_code,
-            match_keyword=group_key or group_option,
-            full_value=group_option,
-            label="组别代码",
-        )
-        # 人员代码：生产实测是 disabled readonly，由组别代码联动自动带出 → 跳过
-
-    # 4.2.3 提交前强校验：组别和人员至少一项非空
-    try:
-        g_now = (await group_input.input_value() or "").strip() if await group_input.count() > 0 else ""
-    except Exception:
-        g_now = ""
-    s_now = ""
+    staff_val = ""
     try:
         if await staff_input.count() > 0:
-            s_now = (await staff_input.input_value() or "").strip()
+            staff_val = (await staff_input.input_value() or "").strip()
     except Exception:
         pass
-    if not g_now and not s_now:
+
+    if _quote_group_ok(group_val, group_key):
+        print(f"  [✓] 组别代码已选中：{group_val}"
+              f"（人员代码：{staff_val or '—'}）")
+        log_audit(f"组别已选中：{group_val} | 人员：{staff_val or '—'}")
+    else:
+        # 4.2.2 二次兜底：重新定位输入框再填一遍（弹窗可能已重渲染）
+        print(f"  [!] 组别代码仍为空/未选中（当前『{group_val or '空'}』）→ 再填一次")
+        group_input, group_val = await _quote_ensure_group_selected(
+            page, dialog, group_input, group_code, group_key, group_option)
+        # 人员代码：生产实测是 disabled readonly，由组别代码联动自动带出 → 跳过
+
+    # 4.2.3 提交前强校验：组别和人员至少一项“有效”
+    #    注意：只输入短号（5175）时 input 有值但没选中，平台会判为空并弹提示，
+    #    所以要用 _quote_group_selected 判断是否真的选成了完整选项。
+    if not _quote_group_ok(group_val, group_key) and not staff_val:
         raise RuntimeError(
             f"『报价任务提交』中组别代码/人员代码均为空 → 中断"
             f"（避免平台弹『组或人员请至少录入一项!』）| 路径={submit_path}"
         )
 
-    await human_delay()
-
     # 4.3 提交任务按钮
+    await _quote_dismiss_group_required_popup(page, timeout=0.2)
     task_submit = dialog.locator("button:has-text('提交任务')").last
     try:
         await task_submit.wait_for(state="visible", timeout=8000)
@@ -6791,10 +7745,55 @@ async def step_quote_submit_superior(page: Page, context: dict, **kwargs) -> dic
         raise RuntimeError(
             "『报价任务提交』弹窗内未找到『提交任务』按钮"
         ) from exc
-    await _quote_click_submit_task(page, dialog)
 
-    # 兜底：保险金额提示框若在『提交任务』之后才弹，也按同一规则处理
-    await handle_insurance_amount_dialogs(page, timeout=2.0)
+    # 4.3.1 点击前紧邻复检：等待按钮期间弹窗异步重渲染可能清空组别 → 发现即重填
+    final_inp = await _quote_locate_group_input(page, dialog) or group_input
+    final_val = await _quote_read_group_value(final_inp)
+    if not _quote_group_ok(final_val, group_key):
+        final_inp, final_val = await _quote_ensure_group_selected(
+            page, dialog, final_inp, group_code, group_key, group_option)
+        group_input = final_inp
+    if not _quote_group_ok(final_val, group_key):
+        s_val = ""
+        try:
+            if await staff_input.count() > 0:
+                s_val = (await staff_input.input_value() or "").strip()
+        except Exception:
+            pass
+        if not s_val:
+            raise RuntimeError(
+                f"提交任务前复检：组别代码/人员代码仍为空（当前『{final_val or '空'}』）"
+                f"→ 中断 | 路径={submit_path}"
+            )
+
+    # 4.4 点『提交任务』→ 若平台仍判组别为空（弹『组或人员请至少录入一项！』），
+    #     关闭提示、重选组别后重试一次；再失败就明确中断，不空等超时。
+    for attempt in (1, 2):
+        if attempt == 2:
+            print("  [!] 平台判定组别为空 → 重新选择组别后再提交一次")
+            log_audit("提交上级：平台判定组别为空 → 重选组别后重试")
+            try:
+                if not await dialog.is_visible():
+                    raise RuntimeError("『报价任务提交』弹窗已关闭，无法重选组别")
+            except Exception as exc:
+                raise RuntimeError(
+                    f"提交上级：组别未选中且弹窗不可用 → 中断: {exc}") from exc
+            group_input, _ = await _quote_ensure_group_selected(
+                page, dialog, group_input, group_code, group_key, group_option)
+            await _quote_dismiss_group_required_popup(page, timeout=0.1)
+
+        await _quote_click_submit_task(page, dialog)
+
+        # 兜底：保险金额提示框若在『提交任务』之后才弹，也按同一规则处理
+        await handle_insurance_amount_dialogs(page, timeout=2.0)
+
+        if not await _quote_dismiss_group_required_popup(page):
+            break
+        if attempt == 2:
+            raise RuntimeError(
+                "提交上级：平台提示『组或人员请至少录入一项！』"
+                "（组别代码未成功选中）→ 中断"
+            )
 
     await _wait_page_result(
         page,
@@ -7111,6 +8110,164 @@ async def _pick_transfer_task_type(page: Page, task_type: str) -> None:
     print(f"  [!] 任务类型下拉没找到『{task_type}』→ 保持默认")
 
 
+def _split_transfer_target(target: str) -> tuple[str, str]:
+    """拆分『工号-姓名』，兼容 - / － / — / –
+
+    平台远程候选只认纯工号：多一个分隔符就没有下拉，输入不足会混入其他人员。
+    因此这里只保留工号里的字母数字部分。
+    """
+    raw = (target or "").strip()
+    parts = re.split(r"[-－—–]", raw, maxsplit=1)
+    code_part = parts[0] if parts else raw
+    name = parts[1].strip() if len(parts) > 1 else ""
+    m = re.search(r"[A-Za-z0-9]+", code_part or "")
+    code = m.group(0) if m else (code_part or "").strip()
+    return code, name
+
+
+async def _transfer_clear_input(target_input) -> None:
+    """可靠清空目标人员输入框（Element UI 对 fill("") 可能保留旧值/分隔符）"""
+    try:
+        await target_input.click(timeout=3000)
+    except Exception:
+        try:
+            await target_input.evaluate(
+                "el => { el.removeAttribute('readonly'); el.focus(); }")
+        except Exception:
+            pass
+    for action in ("Control+a", "Backspace"):
+        try:
+            await target_input.press(action)
+        except Exception:
+            pass
+    try:
+        await target_input.fill("")
+    except Exception:
+        pass
+    await asyncio.sleep(0.1)
+    val = ""
+    try:
+        val = (await target_input.input_value() or "").strip()
+    except Exception:
+        pass
+    if val:
+        try:
+            await target_input.evaluate(
+                "el => { el.value='';"
+                " el.dispatchEvent(new Event('input',{bubbles:true}));"
+                " el.dispatchEvent(new Event('change',{bubbles:true})); }")
+        except Exception:
+            pass
+        await asyncio.sleep(0.1)
+
+
+async def _transfer_pick_target(page: Page, target: str, timeout: float = 8.0) -> str:
+    """在目标人员候选里点中目标；返回选中的候选文本，找不到返回空串"""
+    code, name = _split_transfer_target(target)
+    norm_code = re.sub(r"\s+", "", code or "")
+    norm_name = re.sub(r"\s+", "", name or "")
+
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", "", s or "")
+
+    deadline = time.monotonic() + max(1.0, timeout)
+    seen: list[str] = []
+    while time.monotonic() < deadline:
+        for fr in page.frames:
+            try:
+                opts = fr.locator(
+                    ".el-autocomplete-suggestion:visible li, "
+                    ".el-select-dropdown:visible .el-select-dropdown__item")
+                n = await opts.count()
+            except Exception:
+                continue
+            for i in range(min(n, 30)):
+                opt = opts.nth(i)
+                try:
+                    txt = ((await opt.inner_text(timeout=600)) or "").strip()
+                except Exception:
+                    continue
+                if not txt:
+                    continue
+                if txt not in seen:
+                    seen.append(txt)
+                nt = _norm(txt)
+                # 只认「以工号开头」的候选；短工号绝不做子串匹配，避免误选别人
+                code_ok = bool(norm_code) and nt.startswith(norm_code)
+                if not code_ok and norm_code and len(norm_code) >= 6:
+                    code_ok = norm_code in nt
+                if not code_ok:
+                    continue
+                if norm_name and norm_name not in nt:
+                    continue
+                clicked = False
+                try:
+                    await opt.click(timeout=2000)
+                    clicked = True
+                except Exception:
+                    pass
+                if not clicked:
+                    try:
+                        await opt.evaluate(
+                            "el => {"
+                            " const t = el.querySelector('span') || el;"
+                            " t.dispatchEvent(new MouseEvent('mousedown',{bubbles:true}));"
+                            " t.dispatchEvent(new MouseEvent('mouseup',{bubbles:true}));"
+                            " t.click(); }")
+                        clicked = True
+                    except Exception:
+                        clicked = False
+                if clicked:
+                    return txt
+        await asyncio.sleep(0.25)
+    if seen:
+        print(f"  [!] 目标人员候选里没有『{target}』，可见 {len(seen)} 项：{seen[:8]}")
+        log_audit(f"平级移交：目标人员候选无匹配，可见 {seen[:8]}")
+    return ""
+
+
+async def _transfer_fill_target(page: Page, target_input, target: str) -> None:
+    """填写『任务提交』弹窗里的目标人员（远程搜索 el-select）
+
+    生产实测：只输入完整工号（如 17247339）才有候选；
+    输入少了会混入其他人员，多输入一个『-』则下拉直接变『无数据』。
+    """
+    code, name = _split_transfer_target(target)
+    if not code:
+        raise RuntimeError(f"目标人员配置『{target}』无法解析出工号")
+
+    picked = ""
+    val = ""
+    for attempt in (1, 2):
+        await _transfer_clear_input(target_input)
+        try:
+            await target_input.type(code, delay=60)
+        except Exception as exc:
+            raise RuntimeError(f"目标人员无法输入工号『{code}』: {exc}") from exc
+        print(f"  [i] 目标人员 输入工号『{code}』（第 {attempt} 次），等待候选...")
+        picked = await _transfer_pick_target(page, target, timeout=8.0)
+        if not picked:
+            continue
+        await asyncio.sleep(0.4)
+        try:
+            val = (await target_input.input_value() or "").strip()
+        except Exception:
+            val = ""
+        if val:
+            break
+        print("  [!] 目标人员已点选但输入框为空 → 清空后重试")
+        log_audit("平级移交：目标人员点选后输入框为空 → 重试")
+        picked = ""
+
+    if not picked or not val:
+        raise RuntimeError(
+            f"目标人员『{target}』未能在候选里选中（需输入完整工号『{code}』，"
+            "不能带『-』或只输入片段）")
+
+    print(f"  [✓] 目标人员 → {picked}" + (f"（输入框：{val}）" if val != picked else ""))
+    log_audit(f"平级移交：目标人员选中 {picked}")
+
+
 @register_step(desc="任务中心 → 平级移交 → 报案号查询 → 移交回本人",
                inputs=["claim_no", "transfer_target"])
 async def step_task_transfer_back(page: Page, context: dict, **kwargs) -> None:
@@ -7249,49 +8406,66 @@ async def step_task_transfer_back(page: Page, context: dict, **kwargs) -> None:
             f"弹窗选择器：{SELECTORS_PORTAL['task_transfer_modal']}）"
         )
 
-    target_input = await _find_in_frames(
-        page, [SELECTORS_PORTAL["task_transfer_target_input"]], placeholder="目标人员")
-    if target_input is None:
-        # 弹窗内容是 v-if 动态渲染，先兜底取弹窗内第一个可编辑输入框
-        try:
-            cand = modal.locator("input.el-input__inner:not([readonly])").first
-            if await cand.count() == 0:
-                cand = modal.locator("input:not([readonly])").first
-            target_input = cand if await cand.count() > 0 else None
-        except Exception:
-            target_input = None
-    if target_input is None:
-        raise RuntimeError(
-            "『任务提交』弹窗未找到目标人员输入框（弹窗为动态渲染，"
-            f"当前选择器：{SELECTORS_PORTAL['task_transfer_target_input']}）"
-        )
-    await safe_fill(target_input, target, f"目标人员 → {target}")
-
-    # 生产是 el-autocomplete：填完会弹候选，优先点含工号/姓名的那一条，确保真正选中
-    try:
-        await asyncio.sleep(0.6)
-        code, _, name = target.partition("-")
-        picked = False
-        for fr in page.frames:
-            if picked:
-                break
-            opts = fr.locator(
-                ".el-autocomplete-suggestion:visible li, "
-                ".el-select-dropdown:visible .el-select-dropdown__item")
-            n = await opts.count()
-            for i in range(min(n, 10)):
-                opt = opts.nth(i)
+    # 弹窗外壳会先出现，目标人员输入框随后由 v-if/远程数据异步渲染；
+    # 每轮重新获取弹窗，避免把刚出现弹窗时的空内容误判为流程不可处理。
+    print("  [i] 『任务提交』弹窗已出现 → 等待目标人员输入框加载")
+    log_audit("平级移交：任务提交弹窗已出现，等待目标人员输入框")
+    target_input = None
+    target_wait_seconds = 15.0
+    target_deadline = time.monotonic() + target_wait_seconds
+    while time.monotonic() < target_deadline:
+        current_modal = await _find_in_frames(
+            page, [SELECTORS_PORTAL["task_transfer_modal"]])
+        if current_modal is not None:
+            modal = current_modal
+            target_input = await _find_in_frames(
+                page, [SELECTORS_PORTAL["task_transfer_target_input"]], placeholder="员工代码")
+            if target_input is None:
+                # 兜底只取弹窗内可见、可编辑输入框；排除『组号/组员』，避免填进目标小组。
                 try:
-                    txt = ((await opt.inner_text(timeout=600)) or "").strip()
+                    cand = modal.locator(
+                        "input.el-input__inner:visible:not([readonly]):not([disabled])"
+                        ":not([placeholder*='组号']):not([placeholder*='组员'])").first
+                    if await cand.count() == 0:
+                        cand = modal.locator(
+                            "input:visible:not([readonly]):not([disabled])"
+                            ":not([placeholder*='组号']):not([placeholder*='组员'])").first
+                    if await cand.count() > 0 and await cand.is_visible():
+                        target_input = cand
                 except Exception:
-                    continue
-                if (code and code in txt) or (name and name in txt):
-                    await opt.click(timeout=2500)
-                    print(f"  [✓] 目标人员候选 → {txt}")
-                    picked = True
-                    break
+                    target_input = None
+            if target_input is not None:
+                break
+        await asyncio.sleep(0.5)
+    if target_input is None:
+        visible_fields: list[str] = []
+        try:
+            inputs = modal.locator("input:visible")
+            for i in range(min(await inputs.count(), 8)):
+                field = inputs.nth(i)
+                visible_fields.append(
+                    (await field.get_attribute("placeholder") or
+                     await field.get_attribute("name") or
+                     await field.get_attribute("type") or "未命名输入框")
+                )
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"『任务提交』弹窗未找到目标人员输入框（已等待 {target_wait_seconds:g} 秒，"
+            f"当前选择器：{SELECTORS_PORTAL['task_transfer_target_input']}；"
+            f"可见输入框：{visible_fields or '无'}）"
+        )
+    await _transfer_fill_target(page, target_input, target)
+    target_val = ""
+    try:
+        target_val = (await target_input.input_value() or "").strip()
     except Exception:
         pass
+    code, _ = _split_transfer_target(target)
+    if not target_val or (code and code not in target_val):
+        raise RuntimeError(
+            f"目标人员未成功选中（输入框『{target_val or '空'}』，期望含工号 {code}）"
+            " → 中断，避免提交空目标")
     await human_delay()
 
     submit_btn = await _find_in_frames(page, [SELECTORS_PORTAL["task_transfer_submit_btn"]])

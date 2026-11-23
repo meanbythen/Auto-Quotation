@@ -78,6 +78,100 @@ def current_ledger_path() -> Path:
     return _current_path()
 
 
+def iter_fixed_quote_records():
+    """只读遍历历史工作记录中『修复?=是』的零件，供防重复改价初始化"""
+    if not HAS_OPENPYXL:
+        raise RuntimeError("读取历史工作记录需要 openpyxl")
+    for path in sorted(_ledger_dir().glob("工作记录_*.xlsx")):
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            if "零件明细" not in wb.sheetnames:
+                continue
+            rows = wb["零件明细"].iter_rows(values_only=True)
+            header = next(rows, None)
+            if not header:
+                continue
+            cols = {str(v or "").strip(): i for i, v in enumerate(header)}
+            if "报案号" not in cols or "零件编码" not in cols:
+                continue
+            fixed_col = next((cols[k] for k in ("修复?", "是否修复", "是否修改报价")
+                              if k in cols), None)
+            if fixed_col is None:
+                continue
+            price_col = next((cols[k] for k in ("提交报价(¥)", "提交报价", "最终报价")
+                              if k in cols), None)
+            name_col = next((cols[k] for k in ("零件名称", "名称") if k in cols), None)
+            time_col = next((cols[k] for k in ("时间", "处理时间") if k in cols), None)
+
+            def cell(row, idx):
+                return row[idx] if idx is not None and idx < len(row) else None
+
+            for row in rows:
+                if str(cell(row, fixed_col) or "").strip() != "是":
+                    continue
+                claim_no = str(cell(row, cols["报案号"]) or "").strip().upper()
+                part_code = str(cell(row, cols["零件编码"]) or "").strip().upper()
+                if not claim_no or not part_code:
+                    continue
+                raw_price = cell(row, price_col)
+                try:
+                    quote_price = (float(raw_price)
+                                   if raw_price not in (None, "", "-") else None)
+                except (TypeError, ValueError):
+                    quote_price = None
+                fixed_at = cell(row, time_col)
+                if hasattr(fixed_at, "isoformat"):
+                    fixed_at = fixed_at.isoformat(timespec="seconds")
+                yield {
+                    "claim_no": claim_no,
+                    "part_code": part_code,
+                    "part_name": str(cell(row, name_col) or ""),
+                    "quote_price": quote_price,
+                    "fixed_at": str(fixed_at or ""),
+                }
+        finally:
+            wb.close()
+
+
+def iter_claim_numbers():
+    """只读遍历历史工作记录 Sheet1「理赔报价记录」的报案号
+
+    用于判断“本工号之前是否处理过该案件”：提交上级后选择
+    快速链接『处理』还是平级移交。
+    """
+    if not HAS_OPENPYXL:
+        raise RuntimeError("读取历史工作记录需要 openpyxl")
+    for path in sorted(_ledger_dir().glob("工作记录_*.xlsx")):
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            if "理赔报价记录" not in wb.sheetnames:
+                continue
+            rows = wb["理赔报价记录"].iter_rows(values_only=True)
+            header = next(rows, None)
+            if not header:
+                continue
+            cols = {str(v or "").strip(): i for i, v in enumerate(header)}
+            claim_col = cols.get("报案号")
+            if claim_col is None:
+                continue
+            time_col = next((cols[k] for k in ("处理时间", "时间") if k in cols), None)
+            for row in rows:
+                if claim_col >= len(row):
+                    continue
+                claim_no = str(row[claim_col] or "").strip().upper()
+                if not claim_no:
+                    continue
+                processed_at = ""
+                if time_col is not None and time_col < len(row):
+                    processed_at = row[time_col]
+                    if hasattr(processed_at, "isoformat"):
+                        processed_at = processed_at.isoformat(timespec="seconds")
+                    processed_at = str(processed_at or "")
+                yield {"claim_no": claim_no, "processed_at": processed_at}
+        finally:
+            wb.close()
+
+
 def _thin():
     s = Side(border_style="thin", color="e0e0e0")
     return Border(left=s, right=s, top=s, bottom=s)
