@@ -22,6 +22,10 @@
 python -m PyInstaller "理赔报价机器人.spec" --clean --noconfirm
 ```
 
+## 文档索引
+
+- [EXE 打包方法（PyInstaller）](docs/exe打包方法.md)：spec 固化依赖、路径规范、构建与验收清单。
+
 ## 数据与记录
 
 - 工作记录：`data/ledger/工作记录_YYYYMM.xlsx`
