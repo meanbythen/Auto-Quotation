@@ -8200,6 +8200,101 @@ async def _transfer_clear_input(target_input) -> None:
         await asyncio.sleep(0.1)
 
 
+async def _transfer_locate_target(modal):
+    """只在『任务提交』弹窗内定位目标人员输入框
+
+    不能用 _find_in_frames 做跨页/跨 frame 搜索：提交上级后仍可能残留报价页标签，
+    跨页搜索会把工号填进别的页面同名输入框。
+    """
+    try:
+        loc = modal.locator(SELECTORS_PORTAL["task_transfer_target_input"]).first
+        if await loc.count() > 0 and await loc.is_visible():
+            return loc
+    except Exception:
+        pass
+    for ph in ("员工代码", "员工名称", "目标人员", "人员工号"):
+        try:
+            loc = modal.get_by_placeholder(ph).first
+            if await loc.count() > 0 and await loc.is_visible():
+                return loc
+        except Exception:
+            pass
+    # 兜底：弹窗内第一个可见可编辑输入框，排除『组号/组员』避免填进目标小组
+    try:
+        cand = modal.locator(
+            "input.el-input__inner:visible:not([readonly]):not([disabled])"
+            ":not([placeholder*='组号']):not([placeholder*='组员'])").first
+        if await cand.count() == 0:
+            cand = modal.locator(
+                "input:visible:not([readonly]):not([disabled])"
+                ":not([placeholder*='组号']):not([placeholder*='组员'])").first
+        if await cand.count() > 0 and await cand.is_visible():
+            return cand
+    except Exception:
+        pass
+    return None
+
+
+async def _transfer_tag_present(target_input, code: str, name: str) -> bool:
+    """检查目标人员控件里是否已有『已选标签』（Element UI el-select 多选/已选项）"""
+    try:
+        box = target_input.locator(
+            "xpath=ancestor::*[contains(@class,'el-select')][1]")
+        if await box.count() == 0:
+            return False
+        tags = box.locator(
+            ".el-select__tags .el-tag, .el-select__selected-item, .el-tag")
+        for i in range(min(await tags.count(), 5)):
+            t = re.sub(r"\s+", "", (await tags.nth(i).inner_text(timeout=500) or ""))
+            if (code and code in t) or (name and name in t):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+async def _transfer_suggestion_visible(page: Page) -> bool:
+    """目标人员候选下拉是否仍显示（Element UI 选中候选后会立即收起）"""
+    try:
+        n = await page.locator(
+            ".el-autocomplete-suggestion:visible, .el-select-dropdown:visible, "
+            ".el-autocomplete-suggestion__wrap:visible").count()
+        return n > 0
+    except Exception:
+        return False
+
+
+async def _transfer_selection_confirmed(page: Page, target_input, target: str,
+                                        picked: str = "") -> bool:
+    """判断目标人员是否真的被『选中』，而不只是把工号敲进了输入框
+
+    刚输入工号时输入框值就是 17247339 本身，这种情况绝不能当作已选中；
+    真正选中候选后：候选文本会回填（17247339-胡晨光）、或生成已选标签、
+    或至少候选下拉会收起。三种任一成立才算选中。
+    """
+    code, name = _split_transfer_target(target)
+    ncode = re.sub(r"\s+", "", code or "")
+    nname = re.sub(r"\s+", "", name or "")
+    npicked = re.sub(r"\s+", "", picked or "")
+    try:
+        val = (await target_input.input_value() or "").strip()
+    except Exception:
+        val = ""
+    nval = re.sub(r"\s+", "", val)
+    if not nval:
+        return False
+    if nname and nname in nval:
+        return True
+    if npicked and nval == npicked and nval != ncode:
+        return True
+    if ncode and nval == ncode:
+        # 输入框仍是裸工号 → 看是否有已选标签，或候选下拉是否已收起
+        if await _transfer_tag_present(target_input, ncode, nname):
+            return True
+        return not await _transfer_suggestion_visible(page)
+    return bool(ncode and ncode in nval)
+
+
 async def _transfer_pick_target(page: Page, target: str, timeout: float = 8.0) -> str:
     """在目标人员候选里点中目标；返回选中的候选文本，找不到返回空串"""
     code, name = _split_transfer_target(target)
@@ -8288,6 +8383,18 @@ async def _transfer_fill_target(page: Page, target_input, target: str) -> None:
         if not picked:
             continue
         await asyncio.sleep(0.4)
+        # 关键：输入框里此刻本来就可能有刚敲进去的 17247339，
+        # 必须确认候选真的落到输入框/已选标签上，否则就是“输入了没选中”。
+        if not await _transfer_selection_confirmed(page, target_input, target, picked):
+            try:
+                val = (await target_input.input_value() or "").strip()
+            except Exception:
+                val = ""
+            print(f"  [!] 已点候选但未真正选中（输入框『{val or '空'}』）→ 清空重试")
+            log_audit(f"平级移交：点击候选未真正选中（输入框『{val or '空'}』）→ 重试")
+            picked = ""
+            val = ""
+            continue
         try:
             val = (await target_input.input_value() or "").strip()
         except Exception:
@@ -8301,7 +8408,7 @@ async def _transfer_fill_target(page: Page, target_input, target: str) -> None:
     if not picked or not val:
         raise RuntimeError(
             f"目标人员『{target}』未能在候选里选中（需输入完整工号『{code}』，"
-            "不能带『-』或只输入片段）")
+            "不能带『-』或只输入片段）→ 中断，避免提交空目标")
 
     print(f"  [✓] 目标人员 → {picked}" + (f"（输入框：{val}）" if val != picked else ""))
     log_audit(f"平级移交：目标人员选中 {picked}")
@@ -8457,22 +8564,8 @@ async def step_task_transfer_back(page: Page, context: dict, **kwargs) -> None:
             page, [SELECTORS_PORTAL["task_transfer_modal"]])
         if current_modal is not None:
             modal = current_modal
-            target_input = await _find_in_frames(
-                page, [SELECTORS_PORTAL["task_transfer_target_input"]], placeholder="员工代码")
-            if target_input is None:
-                # 兜底只取弹窗内可见、可编辑输入框；排除『组号/组员』，避免填进目标小组。
-                try:
-                    cand = modal.locator(
-                        "input.el-input__inner:visible:not([readonly]):not([disabled])"
-                        ":not([placeholder*='组号']):not([placeholder*='组员'])").first
-                    if await cand.count() == 0:
-                        cand = modal.locator(
-                            "input:visible:not([readonly]):not([disabled])"
-                            ":not([placeholder*='组号']):not([placeholder*='组员'])").first
-                    if await cand.count() > 0 and await cand.is_visible():
-                        target_input = cand
-                except Exception:
-                    target_input = None
+            # 只在弹窗内找，避免跨页/跨标签把工号填进别的页面同名输入框
+            target_input = await _transfer_locate_target(modal)
             if target_input is not None:
                 break
         await asyncio.sleep(0.5)
@@ -8501,13 +8594,23 @@ async def step_task_transfer_back(page: Page, context: dict, **kwargs) -> None:
     except Exception:
         pass
     code, _ = _split_transfer_target(target)
-    if not target_val or (code and code not in target_val):
+    # 再核一次：输入框里可能只有刚敲进去的裸工号（未真正选中），不能放过
+    if not await _transfer_selection_confirmed(page, target_input, target, target_val):
         raise RuntimeError(
-            f"目标人员未成功选中（输入框『{target_val or '空'}』，期望含工号 {code}）"
+            f"目标人员未成功选中（输入框『{target_val or '空'}』，期望含工号 {code} 及姓名）"
             " → 中断，避免提交空目标")
     await human_delay()
 
-    submit_btn = await _find_in_frames(page, [SELECTORS_PORTAL["task_transfer_submit_btn"]])
+    # 提交按钮优先在弹窗内找，避免点到其它残留页面里的『提交』
+    submit_btn = None
+    try:
+        cand_btn = modal.locator(SELECTORS_PORTAL["task_transfer_submit_btn"]).last
+        if await cand_btn.count() > 0 and await cand_btn.is_visible():
+            submit_btn = cand_btn
+    except Exception:
+        submit_btn = None
+    if submit_btn is None:
+        submit_btn = await _find_in_frames(page, [SELECTORS_PORTAL["task_transfer_submit_btn"]])
     if submit_btn is None:
         submit_btn = modal.get_by_text("提交任务", exact=False).first
     if await submit_btn.count() == 0:
