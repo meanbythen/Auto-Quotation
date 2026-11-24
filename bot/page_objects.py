@@ -8203,23 +8203,42 @@ async def _transfer_clear_input(target_input) -> None:
 async def _transfer_locate_target(modal):
     """只在『任务提交』弹窗内定位目标人员输入框
 
-    不能用 _find_in_frames 做跨页/跨 frame 搜索：提交上级后仍可能残留报价页标签，
-    跨页搜索会把工号填进别的页面同名输入框。
+    生产实测（docs/平级移交/平级移交-目标人员.txt）：弹窗内同时存在两个占位符
+    都是『请输入员工代码或名称』的输入框——前一个是 readonly 的人员代码，
+    后一个才是可编辑的目标人员。按 .first 取会拿到只读框，导致根本敲不进内容，
+    所以必须优先返回「可见且可编辑」的那个。
+
+    另外不能用 _find_in_frames 做跨页/跨 frame 搜索：提交上级后仍可能残留
+    报价页标签，跨页搜索会把工号填进别的页面同名输入框。
     """
+    placeholders = ("员工代码", "员工名称", "目标人员", "人员工号")
+    # 1) 占位符命中里挑「可见 + 可编辑」
+    for ph in placeholders:
+        try:
+            cands = modal.get_by_placeholder(ph)
+            n = await cands.count()
+        except Exception:
+            continue
+        for i in range(min(n, 8)):
+            loc = cands.nth(i)
+            try:
+                if not await loc.is_visible():
+                    continue
+                if await loc.is_editable():
+                    return loc
+            except Exception:
+                continue
+    # 2) 选择器命中里挑「可见 + 可编辑」
     try:
-        loc = modal.locator(SELECTORS_PORTAL["task_transfer_target_input"]).first
-        if await loc.count() > 0 and await loc.is_visible():
-            return loc
+        cands = modal.locator(SELECTORS_PORTAL["task_transfer_target_input"])
+        n = await cands.count()
+        for i in range(min(n, 8)):
+            loc = cands.nth(i)
+            if await loc.is_visible() and await loc.is_editable():
+                return loc
     except Exception:
         pass
-    for ph in ("员工代码", "员工名称", "目标人员", "人员工号"):
-        try:
-            loc = modal.get_by_placeholder(ph).first
-            if await loc.count() > 0 and await loc.is_visible():
-                return loc
-        except Exception:
-            pass
-    # 兜底：弹窗内第一个可见可编辑输入框，排除『组号/组员』避免填进目标小组
+    # 3) 兜底：弹窗内第一个可见可编辑输入框，排除『组号/组员』避免填进目标小组
     try:
         cand = modal.locator(
             "input.el-input__inner:visible:not([readonly]):not([disabled])"
@@ -8232,6 +8251,16 @@ async def _transfer_locate_target(modal):
             return cand
     except Exception:
         pass
+    # 4) 只剩只读框也返回，交给上层给出明确的「只读」诊断，而不是误报未找到
+    for ph in placeholders:
+        try:
+            cands = modal.get_by_placeholder(ph)
+            for i in range(min(await cands.count(), 8)):
+                loc = cands.nth(i)
+                if await loc.is_visible():
+                    return loc
+        except Exception:
+            continue
     return None
 
 
@@ -8373,6 +8402,25 @@ async def _transfer_fill_target(page: Page, target_input, target: str) -> None:
     picked = ""
     val = ""
     for attempt in (1, 2):
+        # 弹窗内有两个同占位符的『员工代码』框，若仍落到只读的人员代码框，
+        # 先点击尝试激活；依旧不可编辑就明确中断，避免“看着像输入了其实敲不进去”。
+        editable = False
+        try:
+            editable = await target_input.is_editable()
+        except Exception:
+            editable = False
+        if not editable:
+            try:
+                await target_input.click(timeout=2000)
+                await asyncio.sleep(0.3)
+                editable = await target_input.is_editable()
+            except Exception:
+                editable = False
+        if not editable:
+            raise RuntimeError(
+                "目标人员输入框为只读（生产弹窗内存在只读『人员代码』框与可编辑"
+                "『目标人员』框，可能定位到了只读框，或移交方式未正确选中）"
+                " → 中断，避免空目标提交")
         await _transfer_clear_input(target_input)
         try:
             await target_input.type(code, delay=60)
