@@ -6848,19 +6848,34 @@ _JS_QUICK_LINK_PROCESS = """
 """
 
 
+async def _quick_link_present(page: Page, timeout: float = 10.0) -> bool:
+    """轮询『系统提示』弹窗里的快速链接专栏是否已渲染（弹窗内容异步加载）"""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        try:
+            info = await page.evaluate(_JS_QUICK_LINK_PROCESS)
+            if isinstance(info, dict) and info.get("found"):
+                return True
+        except Exception:
+            pass
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.4)
+
+
 async def _quote_click_quick_process(page: Page) -> Optional[Page]:
     """提交上级后的『系统提示』弹窗 → 快速链接专栏 → 点『处理』
 
-    之前本工号处理过的报案号，提交上级后会弹「工作流提交成功」提示，
+    之前本工号处理过的报案号，提交上级后会弹「系统提示」，
     下方快速链接专栏里有『处理』按钮：点了就回到本人的报价处理页（九级报价环节），
     可直接报价完成，不需要再走平级移交。
     """
-    info = None
-    try:
-        info = await page.evaluate(_JS_QUICK_LINK_PROCESS)
-    except Exception as exc:
-        print(f"  [!] 查找『快速链接专栏』失败：{type(exc).__name__}: {exc}")
-    if not isinstance(info, dict) or not info.get("found"):
+    if not await _quick_link_present(page, timeout=10.0):
+        info = None
+        try:
+            info = await page.evaluate(_JS_QUICK_LINK_PROCESS)
+        except Exception as exc:
+            print(f"  [!] 查找『快速链接专栏』失败：{type(exc).__name__}: {exc}")
         print(f"  [!] 未找到『快速链接专栏 → 处理』（{(info or {}).get('reason', '')}）")
         return None
 
@@ -6921,25 +6936,15 @@ async def step_quote_finalize(page: Page, context: dict, **kwargs) -> None:
                 return
 
             # 第一次提交上级成功后决定收回路径：
-            #   之前本工号处理过 → 快速链接『处理』→ 当前页报价完成
-            #   首次接收         → 平级移交回本工号后再报价完成
-            seen = context.get("claim_seen_before")
-            if seen is None:
-                try:
-                    from bot.pricing import get_price_service
-                    seen = get_price_service().claim_processed_before(claim_no)
-                except Exception:
-                    seen = False
-                context["claim_seen_before"] = seen
+            # 优先看『系统提示』弹窗里有没有快速链接专栏（实时信号，最可靠），
+            # 有 → 点『处理』→ 新报价页直接做『报价完成』；
+            # 没有 → 回退到平级移交回本工号后再报价完成。
+            # 不再依赖本地 SQLite 历史表预判『首次/二次接收』——弹窗内容才是最终依据。
+            print(f"  [i] {claim_no} 提交上级成功 → 检查弹窗快速链接专栏")
+            log_audit("提交上级成功 → 检查快速链接专栏（优先）")
 
-            if seen:
-                print(f"  [i] {claim_no} 之前本工号处理过 → 尝试快速链接『处理』")
-                new_page = await _quote_click_quick_process(page)
-                if new_page is None:
-                    print("  [!] 未点到快速链接『处理』→ 回退：平级移交回本人后再处理")
-                    log_audit("二次处理未点开快速链接『处理』→ 回退平级移交")
-                    context["transfer_back_needed"] = True
-                    return
+            new_page = await _quote_click_quick_process(page)
+            if new_page is not None:
                 page = new_page
                 context["quote_page"] = page
                 context["quick_process_done"] = True
@@ -6952,7 +6957,8 @@ async def step_quote_finalize(page: Page, context: dict, **kwargs) -> None:
                 await asyncio.sleep(1.0)
                 print("  🔁 已在九级报价环节 → 业务动作改『报价完成』继续提交")
             else:
-                print(f"  [i] {claim_no} 首次接收 → 提交上级后走平级移交回本工号")
+                print("  [i] 弹窗无快速链接专栏 → 走平级移交回本工号后再报价完成")
+                log_audit("弹窗无快速链接专栏 → 回退平级移交")
                 context["transfer_back_needed"] = True
                 return
 
@@ -7675,33 +7681,11 @@ async def step_quote_submit_superior(page: Page, context: dict, **kwargs) -> dic
             "（下拉是长列表，需滚到底精确点击）→ 中断，避免用错误路径提交上级"
         )
 
-    # 4.2 组别代码控件
-    #    优先用稳定 placeholder 定位：弹窗重渲染后 data-bot-field 标记会丢，
-    #    生产实测因此出现 input 解析不到、点击空转 15s 的情况。
-    await _quote_clear_blocking_overlay(page, "组别代码")
-    try:
-        await _wait_no_loading(page, 3.0)
-    except Exception:
-        pass
-    group_input = await _quote_visible_input(dialog, "组号或组名")
-    if group_input is None or await group_input.count() == 0:
-        group_input = await _quote_field_scope(page, ("组别代码", "组别"))
-        if group_input is not None:
-            _gi = group_input.locator("input").first
-            group_input = _gi if await _gi.count() > 0 else group_input
-        else:
-            group_input = page.locator(SELECTORS_PORTAL["quote_task_group_input"]).first
-    if await group_input.count() == 0:
-        raise RuntimeError(
-            "未找到『组别代码』控件（选择器待真机确认："
-            f"{SELECTORS_PORTAL['quote_task_group_input']} 或 label=组别代码）"
-        )
-
-    # 4.2.1 选完提交路径后，系统可能自动带出组别代码；弹窗也可能异步重渲染。
-    #       → 先等自动带出稳定，未带出再远程填写，并做二次重填兜底。
-    group_input, group_val = await _quote_ensure_group_selected(
-        page, dialog, group_input, group_code, group_key, group_option)
-
+    # 4.2 人员代码先行判定（关键分流）：
+    #    已处理过的九级报价案件，选完『九级报价』后人员代码会自动带入上次九级报价员；
+    #    此时**不需要也不能再填组别代码**，直接提交即可 → 之后才会出现带
+    #    『快速链接专栏』的系统提示，点『处理』在当前页完成『报价完成』。
+    #    首次接收的案件人员代码为空，才走『组别代码 → 平台联动带出人员』默认流程。
     staff_input = await _quote_field_scope(page, ("人员代码", "人员"))
     if staff_input is not None:
         _si = staff_input.locator("input").first
@@ -7716,25 +7700,60 @@ async def step_quote_submit_superior(page: Page, context: dict, **kwargs) -> dic
     except Exception:
         pass
 
-    if _quote_group_ok(group_val, group_key):
-        print(f"  [✓] 组别代码已选中：{group_val}"
-              f"（人员代码：{staff_val or '—'}）")
-        log_audit(f"组别已选中：{group_val} | 人员：{staff_val or '—'}")
+    group_input = None
+    group_val = ""
+    if staff_val:
+        print(f"  [i] 人员代码已自动带入『{staff_val}』→ 已处理过的九级报价案件，"
+              "跳过组别代码直接提交")
+        log_audit(f"人员代码已自动带入『{staff_val}』→ 跳过组别代码，直接提交任务")
+        context["quick_process_expected"] = True
     else:
-        # 4.2.2 二次兜底：重新定位输入框再填一遍（弹窗可能已重渲染）
-        print(f"  [!] 组别代码仍为空/未选中（当前『{group_val or '空'}』）→ 再填一次")
+        # 4.2.1 组别代码控件（首次接收）
+        #    优先用稳定 placeholder 定位：弹窗重渲染后 data-bot-field 标记会丢，
+        #    生产实测因此出现 input 解析不到、点击空转 15s 的情况。
+        await _quote_clear_blocking_overlay(page, "组别代码")
+        try:
+            await _wait_no_loading(page, 3.0)
+        except Exception:
+            pass
+        group_input = await _quote_visible_input(dialog, "组号或组名")
+        if group_input is None or await group_input.count() == 0:
+            group_input = await _quote_field_scope(page, ("组别代码", "组别"))
+            if group_input is not None:
+                _gi = group_input.locator("input").first
+                group_input = _gi if await _gi.count() > 0 else group_input
+            else:
+                group_input = page.locator(SELECTORS_PORTAL["quote_task_group_input"]).first
+        if await group_input.count() == 0:
+            raise RuntimeError(
+                "未找到『组别代码』控件（选择器待真机确认："
+                f"{SELECTORS_PORTAL['quote_task_group_input']} 或 label=组别代码）"
+            )
+
+        # 选完提交路径后，系统可能自动带出组别代码；弹窗也可能异步重渲染。
+        # → 先等自动带出稳定，未带出再远程填写，并做二次重填兜底。
         group_input, group_val = await _quote_ensure_group_selected(
             page, dialog, group_input, group_code, group_key, group_option)
-        # 人员代码：生产实测是 disabled readonly，由组别代码联动自动带出 → 跳过
 
-    # 4.2.3 提交前强校验：组别和人员至少一项“有效”
-    #    注意：只输入短号（5175）时 input 有值但没选中，平台会判为空并弹提示，
-    #    所以要用 _quote_group_selected 判断是否真的选成了完整选项。
-    if not _quote_group_ok(group_val, group_key) and not staff_val:
-        raise RuntimeError(
-            f"『报价任务提交』中组别代码/人员代码均为空 → 中断"
-            f"（避免平台弹『组或人员请至少录入一项!』）| 路径={submit_path}"
-        )
+        if _quote_group_ok(group_val, group_key):
+            print(f"  [✓] 组别代码已选中：{group_val}"
+                  f"（人员代码：{staff_val or '—'}）")
+            log_audit(f"组别已选中：{group_val} | 人员：{staff_val or '—'}")
+        else:
+            # 二次兜底：重新定位输入框再填一遍（弹窗可能已重渲染）
+            print(f"  [!] 组别代码仍为空/未选中（当前『{group_val or '空'}』）→ 再填一次")
+            group_input, group_val = await _quote_ensure_group_selected(
+                page, dialog, group_input, group_code, group_key, group_option)
+            # 人员代码：生产实测是 disabled readonly，由组别代码联动自动带出 → 跳过
+
+        # 4.2.2 提交前强校验：组别和人员至少一项“有效”
+        #    注意：只输入短号（5175）时 input 有值但没选中，平台会判为空并弹提示，
+        #    所以要用 _quote_group_selected 判断是否真的选成了完整选项。
+        if not _quote_group_ok(group_val, group_key) and not staff_val:
+            raise RuntimeError(
+                f"『报价任务提交』中组别代码/人员代码均为空 → 中断"
+                f"（避免平台弹『组或人员请至少录入一项!』）| 路径={submit_path}"
+            )
 
     # 4.3 提交任务按钮
     await _quote_dismiss_group_required_popup(page, timeout=0.2)
@@ -7747,29 +7766,36 @@ async def step_quote_submit_superior(page: Page, context: dict, **kwargs) -> dic
         ) from exc
 
     # 4.3.1 点击前紧邻复检：等待按钮期间弹窗异步重渲染可能清空组别 → 发现即重填
-    final_inp = await _quote_locate_group_input(page, dialog) or group_input
-    final_val = await _quote_read_group_value(final_inp)
-    if not _quote_group_ok(final_val, group_key):
-        final_inp, final_val = await _quote_ensure_group_selected(
-            page, dialog, final_inp, group_code, group_key, group_option)
-        group_input = final_inp
-    if not _quote_group_ok(final_val, group_key):
-        s_val = ""
-        try:
-            if await staff_input.count() > 0:
-                s_val = (await staff_input.input_value() or "").strip()
-        except Exception:
-            pass
-        if not s_val:
-            raise RuntimeError(
-                f"提交任务前复检：组别代码/人员代码仍为空（当前『{final_val or '空'}』）"
-                f"→ 中断 | 路径={submit_path}"
-            )
+    #       已处理案件（人员代码已自动带入）不复检/重填组别，避免覆盖系统带入的报价员。
+    if not staff_val:
+        final_inp = await _quote_locate_group_input(page, dialog) or group_input
+        final_val = await _quote_read_group_value(final_inp)
+        if not _quote_group_ok(final_val, group_key):
+            final_inp, final_val = await _quote_ensure_group_selected(
+                page, dialog, final_inp, group_code, group_key, group_option)
+            group_input = final_inp
+        if not _quote_group_ok(final_val, group_key):
+            s_val = ""
+            try:
+                if await staff_input.count() > 0:
+                    s_val = (await staff_input.input_value() or "").strip()
+            except Exception:
+                pass
+            if not s_val:
+                raise RuntimeError(
+                    f"提交任务前复检：组别代码/人员代码仍为空（当前『{final_val or '空'}』）"
+                    f"→ 中断 | 路径={submit_path}"
+                )
 
     # 4.4 点『提交任务』→ 若平台仍判组别为空（弹『组或人员请至少录入一项！』），
     #     关闭提示、重选组别后重试一次；再失败就明确中断，不空等超时。
     for attempt in (1, 2):
         if attempt == 2:
+            if staff_val:
+                raise RuntimeError(
+                    f"提交上级：人员代码已自动带入『{staff_val}』，"
+                    "平台仍提示『组或人员请至少录入一项！』→ 中断"
+                )
             print("  [!] 平台判定组别为空 → 重新选择组别后再提交一次")
             log_audit("提交上级：平台判定组别为空 → 重选组别后重试")
             try:
@@ -7795,13 +7821,26 @@ async def step_quote_submit_superior(page: Page, context: dict, **kwargs) -> dic
                 "（组别代码未成功选中）→ 中断"
             )
 
-    await _wait_page_result(
-        page,
-        success_keywords=["工作流转交成功", "转交成功", "提交成功"],
-        error_keywords=("提交失败", "操作失败", "系统异常"),
-        strict=True,
-        label="提交上级",
-    )
+    # 已处理过的九级报价案件：平台用『系统提示 + 快速链接专栏』代替工作流转交提示，
+    # 所以快速链接专栏本身也视为提交上级成功的证据。
+    if await _quick_link_present(page, timeout=2.0):
+        print("  [✓] 提交上级成功：系统提示含快速链接专栏（已处理案件）")
+        log_audit(f"提交上级成功（快速链接专栏）：报案号 {claim_no}")
+    else:
+        try:
+            await _wait_page_result(
+                page,
+                success_keywords=["工作流转交成功", "转交成功", "提交成功"],
+                error_keywords=("提交失败", "操作失败", "系统异常"),
+                strict=True,
+                label="提交上级",
+            )
+        except RuntimeError:
+            # 成功提示文案可能不同：再确认一次快速链接专栏，仍无才按失败处理
+            if not await _quick_link_present(page, timeout=6.0):
+                raise
+            print("  [✓] 提交上级成功：系统提示含快速链接专栏（已处理案件）")
+            log_audit(f"提交上级成功（快速链接专栏）：报案号 {claim_no}")
     print(f"  [✓] 提交上级成功：任务已转出（{submit_path} / {group_option}）")
     log_audit(f"提交上级成功：报案号 {claim_no} 任务已转出 {group_option}")
     return {
