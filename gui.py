@@ -75,8 +75,8 @@ TEXT_DIM = "#5a6b87"
 
 # ============== 运行模式（四种方式都调用同一套流程逻辑 bot/flows/claim_flow.py）==============
 MODE_OPTIONS = [
-    ("mock_loop", "模拟循环挂机"),
     ("real_loop", "真实循环挂机"),
+    ("mock_loop", "模拟循环挂机"),
     ("single",    "单步测试"),
     ("manual",    "人工测试"),
 ]
@@ -275,7 +275,7 @@ class App:
         self.market_rate_var = tk.BooleanVar(value=True)      # 速率限流（人类节奏）
         self.market_breaker_var = tk.BooleanVar(value=True)   # 封禁熔断（检测到封禁即停止比价+休眠）
         # 运行模式：四种方式都调用同一套流程逻辑（bot/flows/claim_flow.py）
-        self.mode_var = tk.StringVar(value=MODE_LABELS["mock_loop"])
+        self.mode_var = tk.StringVar(value=MODE_LABELS["real_loop"])
         # 超出权限补救：平级移交的目标人员（工号-姓名）
         self.transfer_var = tk.StringVar(value=TRANSFER_TARGET_DEFAULT)
         # 浏览器（多浏览器支持：auto/chrome/edge/360/custom）
@@ -2152,7 +2152,7 @@ class App:
 
     # ---------- 运行模式 ----------
     def _mode_key(self) -> str:
-        return MODE_KEYS.get((self.mode_var.get() or "").strip(), "mock_loop")
+        return MODE_KEYS.get((self.mode_var.get() or "").strip(), "real_loop")
 
     def _refresh_mode_hint(self):
         label = getattr(self, "mode_hint", None)
@@ -2896,7 +2896,7 @@ class App:
                 w.configure(state="disabled")
         self._set_status("已停止", DANGER)
 
-    def _start_loop(self, mode: str = "mock_loop"):
+    def _start_loop(self, mode: str = "real_loop"):
         from bot.main import DEFAULT_CLAIM_NO
         from bot.runners import run_loop
         from bot.runtime import clear_stop
