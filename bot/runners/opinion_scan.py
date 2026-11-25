@@ -72,6 +72,51 @@ def _my_task_urls() -> list[str]:
     return urls
 
 
+async def _try_cancel_version(page: Page) -> bool:
+    """检查当前页是否有『友情提示：最新版本为 32190…是否跳转』，有就点『取消』"""
+    try:
+        if page is None or page.is_closed():
+            return False
+    except Exception:
+        return False
+    for frame in page.frames:
+        try:
+            boxes = frame.locator(".el-message-box, .el-dialog")
+            for i in range(min(await boxes.count(), 4)):
+                box = boxes.nth(i)
+                try:
+                    if not await box.is_visible():
+                        continue
+                    text = (await box.inner_text() or "")
+                except Exception:
+                    continue
+                if "最新版本" not in text:
+                    continue
+                btn = box.locator("button:has-text('取消')").first
+                if await btn.count() == 0 or not await btn.is_visible():
+                    continue
+                await btn.click(timeout=3000)
+                _log("采集意见 | 版本提示已关闭（点『取消』）")
+                log_audit("采集意见：关闭版本升级提示（取消）")
+                await page.wait_for_timeout(300)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def dismiss_version_prompt(page: Page, timeout: float = 0.0) -> bool:
+    """轮询关闭版本提示；timeout=0 只检查一次"""
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + max(0.0, timeout)
+    while True:
+        if await _try_cancel_version(page):
+            return True
+        if loop.time() >= deadline:
+            return False
+        await page.wait_for_timeout(400)
+
+
 async def _live_page(page: Page) -> Page:
     """页面被关闭时从同一 context 取其它 tab"""
     try:
@@ -121,6 +166,7 @@ async def _goto_my_task(page: Page, url: str) -> bool:
         _log(f"采集意见 | 直连失败 {url}：{type(exc).__name__}")
         return False
     for _ in range(30):
+        await dismiss_version_prompt(page)
         if await _my_tasks_ready(page):
             return True
         await page.wait_for_timeout(500)
@@ -258,6 +304,7 @@ async def _query(page: Page) -> bool:
     except Exception as exc:
         _log(f"采集意见 | 点击查询失败: {exc}")
         return False
+    await dismiss_version_prompt(page, 1.0)
     await _wait_loaded(page)
     try:
         total = (await page.locator(_TOTAL).first.inner_text(timeout=2000) or "").strip()
@@ -316,7 +363,11 @@ async def _next_page(page: Page) -> bool:
 
 
 async def _open_claim(page: Page, claim_no: str):
-    """点击报案号，返回 (报价处理页, 是否新标签页)"""
+    """点击报案号 → 等『报价处理』新标签页 → 返回 (报价处理页, 是否新标签页)
+
+    最多等 10 秒；没等到新标签页就判失败并保留列表状态，
+    绝不把『我的任务』列表页当成报价页去读（会导致列表丢失、被迫重新查询）。
+    """
     try:
         link = page.locator(_CLAIM_LINK).filter(has_text=claim_no).first
         if await link.count() == 0:
@@ -325,22 +376,40 @@ async def _open_claim(page: Page, claim_no: str):
             _log(f"采集意见 | 当前页找不到报案号 {claim_no}")
             return None, False
         await link.scroll_into_view_if_needed(timeout=3000)
-        pages_before = len(page.context.pages)
+        pages_before = list(page.context.pages)
+        before_url = page.url
         await link.click(timeout=6000)
-        await page.wait_for_timeout(2500)
-        if len(page.context.pages) > pages_before:
-            quote = page.context.pages[-1]
-            await quote.bring_to_front()
+
+        quote = None
+        for _ in range(40):
             try:
-                await quote.wait_for_load_state("domcontentloaded", timeout=10000)
+                new_pages = [p for p in page.context.pages
+                             if p not in pages_before and not p.is_closed()]
+            except Exception:
+                new_pages = []
+            if new_pages:
+                quote = new_pages[-1]
+                break
+            try:
+                if page.url != before_url:
+                    quote = page
+                    break
             except Exception:
                 pass
-            return quote, True
+            await page.wait_for_timeout(250)
+        if quote is None:
+            _log(f"采集意见 | {claim_no} 未打开报价处理页（列表保持不变）")
+            return None, False
+
+        new_tab = quote is not page
+        await quote.bring_to_front()
         try:
-            await page.wait_for_load_state("domcontentloaded", timeout=8000)
+            await quote.wait_for_load_state("domcontentloaded", timeout=10000)
         except Exception:
             pass
-        return page, False
+        await quote.wait_for_timeout(800)
+        await dismiss_version_prompt(quote, 3.0)
+        return quote, new_tab
     except Exception as exc:
         _log(f"采集意见 | 打开案件失败 {claim_no}: {exc}")
         return None, False
@@ -362,15 +431,16 @@ async def _back_to_list(list_page: Page, quote, new_tab: bool) -> tuple[Page, bo
                 await quote.close()
             except Exception:
                 pass
-            await list_page.bring_to_front()
         else:
             await list_page.go_back()
             await list_page.wait_for_timeout(1500)
+        await list_page.bring_to_front()
     except Exception as exc:
         _log(f"采集意见 | 返回列表失败: {exc}")
 
     # 列表可能因页面回退而丢失筛选/隐藏，需确认真的可见
     if await _list_visible(list_page):
+        await dismiss_version_prompt(list_page)
         return list_page, True, False
 
     _log("采集意见 | 列表状态丢失，重新打开我的任务并查询")
@@ -393,6 +463,7 @@ async def scan_my_tasks(page: Page, max_claims: int = 30,
     list_page = await _open_my_tasks(page)
     if list_page is None:
         return result
+    await dismiss_version_prompt(list_page, 1.0)
     await _ensure_filters(list_page)
     if not await _query(list_page):
         return result

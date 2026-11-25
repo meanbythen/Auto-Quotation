@@ -91,6 +91,8 @@ _DIAG_JS = r"""
 _FIELD_ALIASES = (
     ("publish_time", ("发表意见时间", "发表时间", "操作时间", "处理时间", "时间", "日期")),
     ("staff_code",   ("人员工号", "员工工号", "操作人工号", "工号", "员工代码", "操作人")),
+    ("staff_name",   ("姓名", "人员姓名", "操作人姓名")),
+    ("role",         ("角色", "岗位", "处理角色")),
     ("org_name",     ("机构名称", "所属机构", "机构", "部门")),
     ("return_eval",  ("退回评价", "评价", "退回意见")),
     ("opinion_note", ("意见说明", "说明", "备注")),
@@ -245,8 +247,9 @@ def format_opinion(opinion: Optional[dict], limit: int = 40) -> str:
     if not parts:
         parts.append(str(opinion.get("raw_text") or "")[:limit])
     who = str(opinion.get("staff_code") or "").strip()
+    role = str(opinion.get("role") or "").strip()
     when = str(opinion.get("publish_time") or "").strip()
-    prefix = " ".join(x for x in (who, when) if x)
+    prefix = " ".join(x for x in (role, who, when) if x)
     return (f"{prefix} " if prefix else "") + " / ".join(parts)
 
 

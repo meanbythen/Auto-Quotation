@@ -8104,6 +8104,32 @@ async def _transfer_form_ready(page: Page) -> bool:
         return False
 
 
+async def _transfer_form_on(page: Page) -> bool:
+    """只看当前这一页（含 iframe）是否有平级移交表单，不跨标签页
+
+    多标签并行时（门户 / 我的任务 / 平级移交）必须按页判断，
+    否则会把『别的 tab 里已打开的表单』当成这个新 tab 已就绪。
+    """
+    try:
+        if page is None or page.is_closed():
+            return False
+        for frame in page.frames:
+            try:
+                loc = frame.locator(SELECTORS_PORTAL["task_transfer_claim_input"]).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    return True
+            except Exception:
+                pass
+            try:
+                if await frame.get_by_placeholder("报案号").count() > 0:
+                    return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return False
+
+
 async def _open_transfer_by_menu(page: Page):
     """左侧菜单打开『平级移交』，返回承载页（可能是新开的 tab）
 
@@ -8197,7 +8223,11 @@ async def _open_transfer_by_menu(page: Page):
 
 
 async def _open_transfer_page(page: Page, portal_url: str = "") -> Page:
-    """打开『平级移交』页：先直连已知地址，再退回左侧菜单（任务中心 → 平级移交）"""
+    """打开『平级移交』页：一律在新标签页打开，『理赔作业门户』标签保持不动
+
+    顺序：复用已打开的平级移交 tab → 新标签页直连已知地址
+          → 门户菜单 data-url（折叠也能读到）新标签页直连 → 左侧菜单点击（自身新开 tab）
+    """
     import bot.config as _cfg
 
     page = await _live_page(page)
@@ -8206,6 +8236,20 @@ async def _open_transfer_page(page: Page, portal_url: str = "") -> Page:
         await page.goto(MOCK_URLS["task_transfer"], wait_until="domcontentloaded")
         return page
 
+    # ① 已打开的平级移交 tab 直接复用
+    try:
+        for p in page.context.pages:
+            if p is page or p.is_closed():
+                continue
+            if "tasktransfer" in (p.url or "").lower() and await _transfer_form_on(p):
+                await p.bring_to_front()
+                print("  [✓] 复用已打开的『平级移交』标签页")
+                return p
+    except Exception:
+        pass
+
+    # ② 新标签页直连
+    tab = None
     candidates = [TASK_TRANSFER_URL, getattr(cfg, "TASK_TRANSFER_URL_ALT", "")]
     candidates += list(getattr(cfg, "TASK_TRANSFER_URL_ALTS", ()) or ())
     seen = set()
@@ -8213,69 +8257,91 @@ async def _open_transfer_page(page: Page, portal_url: str = "") -> Page:
         if not url or url in seen:
             continue
         seen.add(url)
-        page = await _live_page(page)
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
+            if tab is None or tab.is_closed():
+                tab = await page.context.new_page()
+            await tab.goto(url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
         except Exception as exc:
             print(f"  [!] 平级移交直连失败（{url[:70]}）：{type(exc).__name__}")
             continue
-        for _ in range(10):
-            if await _transfer_form_ready(page):
-                print("  [✓] 已打开『平级移交』页（直连）")
-                return page
+        for _ in range(12):
+            if await _transfer_form_on(tab):
+                print("  [✓] 已打开『平级移交』页（新标签页直连）")
+                log_audit(f"平级移交新标签页直连成功: {url}")
+                return tab
             await asyncio.sleep(0.5)
+    if tab is not None:
+        try:
+            await tab.close()
+        except Exception:
+            pass
 
-    page = await _live_page(page)
+    # ③ 门户菜单 data-url（菜单即使折叠成图标也能读到）→ 新标签页直连
+    view = await _live_page(page)
     portal_url = portal_url or cfg.PORTAL_REAL_URL
     try:
-        await page.goto(portal_url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
+        if (view.url or "") != portal_url:
+            await view.goto(portal_url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
     except Exception:
         pass
-    # 等 SPA 把左侧菜单渲染出来（菜单折叠也不影响读取 data-url）
     for _ in range(20):
         try:
-            if await page.locator(".menu-item-text[data-url*='taskTransfer']").count() > 0:
+            if await view.locator(".menu-item-text[data-url*='taskTransfer']").count() > 0:
                 break
         except Exception:
             pass
         await asyncio.sleep(0.5)
 
-    # ② 从门户菜单 DOM 读 data-url 直连（菜单即使折叠成图标也能读到；
-    #    实测 data-url="/claimcar/taskTransfer/TaskTransferQuery"）
     menu_url = ""
     try:
-        loc = page.locator(".menu-item-text[data-url*='taskTransfer']").first
+        loc = view.locator(".menu-item-text[data-url*='taskTransfer']").first
         if await loc.count() > 0:
             menu_url = (await loc.get_attribute("data-url") or "").strip()
     except Exception:
         menu_url = ""
+
     if menu_url:
         from urllib.parse import urljoin
-        full = urljoin(page.url or cfg.PORTAL_REAL_URL, menu_url)
-        page = await _live_page(page)
+        full = urljoin(view.url or cfg.PORTAL_REAL_URL, menu_url)
+        tab2 = None
         try:
-            await page.goto(full, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
-            for _ in range(10):
-                if await _transfer_form_ready(page):
-                    print(f"  [✓] 已打开『平级移交』页（菜单 data-url: {menu_url}）")
-                    log_audit(f"平级移交 data-url 打开成功: {menu_url}")
-                    return page
-                await asyncio.sleep(0.5)
+            tab2 = await view.context.new_page()
+            await tab2.goto(full, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
         except Exception as exc:
             print(f"  [!] 菜单 data-url 打开失败：{type(exc).__name__}")
+        if tab2 is not None:
+            for _ in range(12):
+                if await _transfer_form_on(tab2):
+                    print(f"  [✓] 已打开『平级移交』页（菜单 data-url: {menu_url}）")
+                    log_audit(f"平级移交 data-url 打开成功: {menu_url}")
+                    return tab2
+                await asyncio.sleep(0.5)
+            try:
+                await tab2.close()
+            except Exception:
+                pass
 
-    found = await _open_transfer_by_menu(page)
-    if found is not None:
+    # ④ 左侧菜单点击（该入口自身会新开标签页）
+    found = await _open_transfer_by_menu(view)
+    if found is not None and found is not view:
         for _ in range(10):
-            if await _transfer_form_ready(found):
+            if await _transfer_form_on(found):
                 print("  [✓] 已打开『平级移交』页（菜单）")
                 log_audit("平级移交页已打开（菜单）")
                 return found
             await asyncio.sleep(0.5)
+        return found
+    if found is not None:
+        # 菜单把门户页原地跳走了：虽非新标签，但能继续（比直接失败好）
+        for _ in range(8):
+            if await _transfer_form_on(view):
+                print("  [!] 平级移交在当前标签打开（菜单兜底）")
+                return view
+            await asyncio.sleep(0.5)
     # 最后兜底：任一已开 tab 里已有平级移交表单
     try:
-        for p in page.context.pages:
-            if not p.is_closed() and await _transfer_form_ready(p):
+        for p in view.context.pages:
+            if not p.is_closed() and await _transfer_form_on(p):
                 return p
     except Exception:
         pass
