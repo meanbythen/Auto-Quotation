@@ -575,6 +575,9 @@ class App:
         self.pause_btn = self._make_btn(btns, "⏸ 暂停", WARNING, SURFACE_2,
                                         self.on_pause_button)
         self.pause_btn.pack(side="left", padx=(8, 0))
+        self.collect_btn = self._make_btn(btns, "🧾 采集意见", ACCENT, SURFACE_2,
+                                          self.on_collect_opinions)
+        self.collect_btn.pack(side="left", padx=(8, 0))
 
         # ---------- 🧠 学习模式（某步失败 → 暂停等你手动处理 → 存技能） ----------
         learn = tk.Frame(card, bg=SURFACE)
@@ -2270,12 +2273,21 @@ class App:
             pause.configure(text=pause_text, bg=pause_bg, fg=pause_fg,
                             state="normal" if scanning else "disabled")
 
+        collect = self._ui("collect_btn")
+        if collect is not None:
+            busy = scanning or bool(getattr(self, "_collect_active", False))
+            collect.configure(
+                text="🧾 采集中..." if getattr(self, "_collect_active", False) else "🧾 采集意见",
+                state="normal" if browser_open and not busy else "disabled")
+
         # 单步/人工测试运行中禁用挂机相关按钮
         if self.is_running and self._loop_env is None:
             start.configure(state="disabled")
             scan.configure(state="disabled")
             if pause is not None:
                 pause.configure(state="disabled")
+            if collect is not None:
+                collect.configure(state="disabled")
 
     def _ensure_loop_thread(self):
         """启动持久 asyncio loop 线程（只启一次，后续复用）"""
@@ -2345,6 +2357,64 @@ class App:
             log_run("   👉 现在可以在浏览器里自由查询/操作，完成后点『▶ 恢复』继续")
             log_audit("点击『⏸ 暂停』（pause_event.set）")
         self._update_button_states()
+
+    # ---------- 回调 4: collect_btn（🧾 采集意见）----------
+    def on_collect_opinions(self):
+        """空闲时段批量采集：我的任务 → 三月内/全部 → 逐案读取报价处理意见"""
+        if self._loop_env is None or not self._loop_env.started:
+            messagebox.showinfo("提示", "请先点『▶ 开始挂机』拉起浏览器并登录")
+            return
+        if self._scan_active or getattr(self, "_collect_active", False):
+            messagebox.showinfo("提示", "扫描或采集正在进行，请等待结束")
+            return
+        from tkinter import simpledialog
+        n = simpledialog.askinteger("采集意见", "最多采集多少个案件？",
+                                    initialvalue=30, minvalue=1, maxvalue=200,
+                                    parent=self.root)
+        if not n:
+            return
+
+        self._collect_active = True
+        self._update_button_states()
+        self._set_status("正在采集报价处理意见（可随时点『停止挂机』中断）...", ACCENT)
+        log_audit(f"点击『采集意见』→ 最多 {n} 个案件")
+
+        import asyncio as _asyncio
+        from bot.runtime import clear_stop, stop_requested
+
+        env = self._loop_env
+        self._ensure_loop_thread()
+        assert self._loop_loop is not None
+        clear_stop()
+
+        async def job():
+            from bot.runners.opinion_scan import scan_my_tasks
+            return await scan_my_tasks(env.portal_page, max_claims=n,
+                                       stop_event=_StopFlag(stop_requested))
+
+        def run():
+            try:
+                fut = _asyncio.run_coroutine_threadsafe(job(), self._loop_loop)
+                res = fut.result()
+                self.root.after(0, lambda: self._on_collect_done(res))
+            except Exception as e:
+                log_error("采集意见失败", e)
+                self.root.after(0, lambda: (
+                    self._set_status("采集意见失败，详见日志", WARNING),
+                    self._update_button_states(),
+                ))
+            finally:
+                self._collect_active = False
+                self.root.after(0, self._update_button_states)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_collect_done(self, res: dict):
+        r = res or {}
+        self._set_status(
+            f"采集完成：案件 {r.get('claims', 0)} | 有意见 {r.get('with_opinion', 0)}"
+            f" | 入库 {r.get('saved', 0)} | 失败 {r.get('failed', 0)}", SUCCESS)
+        log_run(f"采集意见完成：{r}")
 
     # ---------- 具体动作：拉起浏览器 / 关浏览器 / 开始扫描 / 停止扫描 ----------
     def _open_browser_and_wait_login(self):
@@ -3224,6 +3294,19 @@ def main():
         except Exception:
             pass
         raise
+
+
+class _StopFlag:
+    """把 bot.runtime.stop_requested 适配成 is_set() 接口，供采集循环轮询"""
+
+    def __init__(self, fn):
+        self._fn = fn
+
+    def is_set(self) -> bool:
+        try:
+            return bool(self._fn())
+        except Exception:
+            return False
 
 
 if __name__ == "__main__":
