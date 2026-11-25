@@ -378,25 +378,41 @@ async def _open_claim(page: Page, claim_no: str):
         await link.scroll_into_view_if_needed(timeout=3000)
         pages_before = list(page.context.pages)
         before_url = page.url
-        await link.click(timeout=6000)
 
         quote = None
-        for _ in range(40):
+        for attempt in (1, 2):
+            await dismiss_version_prompt(page)
             try:
-                new_pages = [p for p in page.context.pages
-                             if p not in pages_before and not p.is_closed()]
-            except Exception:
-                new_pages = []
-            if new_pages:
-                quote = new_pages[-1]
-                break
-            try:
-                if page.url != before_url:
-                    quote = page
+                await link.click(timeout=6000)
+            except Exception as exc:
+                _log(f"采集意见 | 报案号点击被拦截（第 {attempt} 次）：{type(exc).__name__}")
+                if await dismiss_version_prompt(page, 2.0):
+                    continue
+            # 等新标签页（最多 10 秒）
+            for _ in range(40):
+                try:
+                    new_pages = [p for p in page.context.pages
+                                 if p not in pages_before and not p.is_closed()]
+                except Exception:
+                    new_pages = []
+                if new_pages:
+                    quote = new_pages[-1]
                     break
-            except Exception:
-                pass
-            await page.wait_for_timeout(250)
+                try:
+                    if page.url != before_url:
+                        quote = page
+                        break
+                except Exception:
+                    pass
+                await page.wait_for_timeout(250)
+            if quote is not None:
+                break
+            # 没打开：若是版本弹窗吞掉了点击，关掉后重试一次
+            if attempt == 1 and await _try_cancel_version(page):
+                _log("采集意见 | 版本提示挡住了报案号，已点『取消』，重试点击")
+                continue
+            break
+
         if quote is None:
             _log(f"采集意见 | {claim_no} 未打开报价处理页（列表保持不变）")
             return None, False
@@ -453,6 +469,29 @@ async def _back_to_list(list_page: Page, quote, new_tab: bool) -> tuple[Page, bo
     return fresh, True, True
 
 
+async def _dialog_guard(get_pages, stop: asyncio.Event, interval: float = 0.8) -> None:
+    """后台持续关闭『友情提示：最新版本…』弹窗
+
+    该弹窗带 .v-modal 遮罩，会挡住报案号点击与意见表格，
+    只在固定时机清一次不够——它会在翻页/回列表/开价时随时再弹。
+    """
+    while not stop.is_set():
+        try:
+            for p in list(get_pages()):
+                try:
+                    if p.is_closed():
+                        continue
+                except Exception:
+                    continue
+                await _try_cancel_version(p)
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def scan_my_tasks(page: Page, max_claims: int = 30,
                         stop_event=None, timeout: float = 8.0) -> dict:
     """批量采集我的任务里的报价处理意见；返回统计 dict"""
@@ -463,11 +502,30 @@ async def scan_my_tasks(page: Page, max_claims: int = 30,
     list_page = await _open_my_tasks(page)
     if list_page is None:
         return result
-    await dismiss_version_prompt(list_page, 1.0)
-    await _ensure_filters(list_page)
-    if not await _query(list_page):
-        return result
 
+    # 版本提示弹窗带遮罩，会挡住筛选/查询/报案号点击，后台持续清理
+    guard_stop = asyncio.Event()
+    guard = asyncio.create_task(
+        _dialog_guard(lambda: list_page.context.pages, guard_stop))
+    try:
+        await dismiss_version_prompt(list_page, 1.0)
+        await _ensure_filters(list_page)
+        if not await _query(list_page):
+            return result
+        await _scan_loop(list_page, limit, result, stop_event, timeout)
+    finally:
+        guard_stop.set()
+        guard.cancel()
+        try:
+            await guard
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    return _finish(result)
+
+
+async def _scan_loop(list_page: Page, limit: int, result: dict,
+                     stop_event, timeout: float) -> None:
     seen: set[str] = set()
     guard = 0
     while len(seen) < limit and not _stopped(stop_event):
@@ -520,12 +578,10 @@ async def scan_my_tasks(page: Page, max_claims: int = 30,
                 await list_page.wait_for_timeout(500)
             if not ok:
                 _log("采集意见 | 无法返回我的任务列表，提前结束")
-                return _finish(result)
+                return
             if reset:
                 # 列表被重新查询（回到第 1 页），重新读当前页并按 seen 跳过
                 break
-
-    return _finish(result)
 
 
 def _finish(result: dict) -> dict:
