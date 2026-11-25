@@ -2,6 +2,7 @@
 全局配置 —— 单一事实来源
 """
 from pathlib import Path
+import os
 import sys
 
 # ============ 路径（兼容 PyInstaller 打包后 sys._MEIPASS 解包临时目录） ============
@@ -23,6 +24,19 @@ if getattr(sys, "frozen", False):
     BOT_PROFILE_DIR = _exe_dir / "data" / "chrome_bot_profile"
 else:
     BOT_PROFILE_DIR = BOT_DIR / "chrome_bot_profile"
+
+# ============ 智能意见判断（P0：只采集 + 建议，不改变执行） ============
+# off     完全不读意见，行为与旧版一致
+# advise  读意见并记录判断依据，但不改变执行（灰度第一阶段）
+# confirm 中置信度弹窗确认（P1 启用）
+# auto    高置信度自动执行（P2 启用）
+INTELLIGENCE_MODE = os.environ.get("BOT_INTELLIGENCE_MODE", "advise").strip().lower()
+INTELLIGENCE_AUTO_THRESHOLD = 0.80
+INTELLIGENCE_CONFIRM_THRESHOLD = 0.55
+INTELLIGENCE_COLLECT = True          # 挂机随单采集语料
+INTELLIGENCE_SOURCE = "hang"
+# 意见列表通常异步渲染，读取采用有界轮询
+INTELLIGENCE_READ_TIMEOUT = float(os.environ.get("BOT_INTELLIGENCE_READ_TIMEOUT", "8"))
 
 # ============ 本地模拟服务器（理赔门户内网限制，只能 mock） ============
 MOCK_SERVER_HOST = "127.0.0.1"
@@ -171,6 +185,15 @@ SELECTORS_PORTAL = {
     "quote_submit_btn":          "#submit-quote-btn, button:has-text('提交')",
     "quote_submit_confirm":      "#confirm-quote-submit, button:has-text('提交任务')",
     "quote_result_tip":          "#quote-toast, .toast, .el-message, .el-notification",
+
+    # --- 报价处理意见列表（P0 采集：容器/行/空态，真实站点未知时用文本定位兜底） ---
+    "opinion_list_container":    ("#quote-opinion-list, .quote-opinion-list, "
+                                  ".el-table:has-text('发表意见时间'), "
+                                  ".el-table:has-text('意见说明'), "
+                                  "table:has-text('意见说明')"),
+    "opinion_list_row":          ("#quote-opinion-list tbody tr, .quote-opinion-list tbody tr, "
+                                  ".el-table__body tr, table tbody tr"),
+    "opinion_list_empty":        ".el-table__empty-text, .empty-text, .no-data",
 
     # --- 提交上级弹窗「报价任务提交」：提交路径 / 组别代码 / 人员代码 / 提交任务 ---
     "quote_task_dialog":         "#quote-task-dialog, .modal[data-modal='quote-task'], .el-dialog:has-text('报价任务提交')",

@@ -6905,6 +6905,61 @@ async def _quote_click_quick_process(page: Page) -> Optional[Page]:
     return page
 
 
+@register_step(desc="报价处理意见 → 读取最新意见并判断动作（P0 只建议）")
+async def step_read_opinion_and_decide(page: Page, context: dict, **kwargs) -> dict:
+    """
+    STEP 1.5：读取「报价处理意见列表」最新一条 → 规则判断动作。
+
+    P0 只做采集与建议：不改动任何后续执行分支，读不到意见也不影响主流程。
+    """
+    claim_no = context.get("claim_no", "")
+    try:
+        from bot.intelligence import (decide, enabled, format_opinion,
+                                      mode, read_latest_opinion,
+                                      record_opinion, record_prediction)
+    except Exception as exc:
+        print(f"  [!] 智能意见模块加载失败（不影响主流程）: {type(exc).__name__}: {exc}")
+        log_run(f"智能意见模块加载失败: {type(exc).__name__}: {exc}")
+        return {}
+
+    if not enabled():
+        print("  [i] 智能意见判断已关闭（INTELLIGENCE_MODE=off）")
+        return {}
+
+    timeout = float(kwargs.get("opinion_read_timeout") or cfg.INTELLIGENCE_READ_TIMEOUT)
+    print(f"\n🧠 STEP 1.5: 读取报价处理意见（模式={mode()}，超时={timeout:g}s）")
+    try:
+        opinion = await read_latest_opinion(page, timeout=timeout, claim_no=claim_no)
+    except Exception as exc:
+        print(f"  [!] 读取意见异常（不影响主流程）: {type(exc).__name__}: {exc}")
+        log_run(f"读取报价处理意见异常 | {claim_no} | {type(exc).__name__}: {exc}")
+        return {}
+
+    if not opinion:
+        print("  [i] 未读取到报价处理意见 → 保持原流程")
+        log_audit(f"未读取到报价处理意见 | {claim_no}")
+        return {}
+
+    decision = decide(opinion)
+    print(f"  [✓] 最新意见: {format_opinion(opinion)}")
+    print(f"  [✓] 判断结果: {decision.label}（{decision.confidence:.2f}，{decision.reason}）")
+
+    corpus_id = 0
+    if cfg.INTELLIGENCE_COLLECT:
+        corpus_id = record_opinion(claim_no, opinion, source=cfg.INTELLIGENCE_SOURCE)
+    record_prediction(claim_no, decision, corpus_id=corpus_id,
+                      decided_action="", executed=False)
+    log_audit(f"意见判断 | {claim_no} | {format_opinion(opinion)} | "
+              f"{decision.action}/{decision.label} | 置信度={decision.confidence:.2f} | "
+              f"依据={decision.reason} | 模式={mode()}")
+
+    data = decision.to_dict()
+    data["order_uncertain"] = bool(opinion.get("order_uncertain"))
+    data["corpus_id"] = corpus_id
+    context["opinion_decision"] = data
+    return data
+
+
 @register_step(desc="报价处理 → 报价完成 → 提交任务")
 async def step_quote_finalize(page: Page, context: dict, **kwargs) -> None:
     print(f"\n🔹 STEP 9: 报价处理 → 报价完成 → 提交任务")

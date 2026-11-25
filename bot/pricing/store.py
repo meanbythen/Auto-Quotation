@@ -78,6 +78,52 @@ CREATE TABLE IF NOT EXISTS claim_color_return_history (
     pass_count  INTEGER NOT NULL DEFAULT 1,
     note        TEXT DEFAULT ''
 );
+
+-- 报价处理意见语料（P0：只采集，不改变执行）
+CREATE TABLE IF NOT EXISTS opinion_corpus (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    claim_no     TEXT NOT NULL,
+    staff_code   TEXT DEFAULT '',
+    org_name     TEXT DEFAULT '',
+    publish_time TEXT DEFAULT '',
+    opinion      TEXT DEFAULT '',
+    opinion_note TEXT DEFAULT '',
+    return_eval  TEXT DEFAULT '',
+    submit_path  TEXT DEFAULT '',
+    prev_action  TEXT DEFAULT '',
+    source       TEXT DEFAULT '',
+    raw_json     TEXT DEFAULT '',
+    captured_at  TEXT NOT NULL,
+    dedup_hash   TEXT NOT NULL,
+    UNIQUE(claim_no, dedup_hash)
+);
+
+-- 人工/规则标签（P1 使用，P0 先建表）
+CREATE TABLE IF NOT EXISTS opinion_label (
+    corpus_id  INTEGER PRIMARY KEY,
+    action     TEXT NOT NULL,
+    confidence REAL DEFAULT 1.0,
+    labeler    TEXT DEFAULT 'human',
+    labeled_at TEXT NOT NULL,
+    note       TEXT DEFAULT ''
+);
+
+-- 每次判断的预测记录（P0 起写入，供灰度对比）
+CREATE TABLE IF NOT EXISTS opinion_prediction (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    claim_no       TEXT NOT NULL,
+    corpus_id      INTEGER,
+    action         TEXT NOT NULL,
+    confidence     REAL NOT NULL,
+    model_version  TEXT DEFAULT '',
+    decided_action TEXT DEFAULT '',
+    overridden_by  TEXT DEFAULT '',
+    executed       INTEGER DEFAULT 0,
+    ts             TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_opinion_corpus_claim ON opinion_corpus(claim_no);
+CREATE INDEX IF NOT EXISTS idx_opinion_prediction_ts ON opinion_prediction(ts DESC);
 """
 
 
@@ -448,6 +494,100 @@ class PriceStore:
                     "INSERT OR IGNORE INTO claim_process_history"
                     "(claim_no, first_processed_at, last_processed_at, passes)"
                     " VALUES(?,?,?,?)", rows)
+                self._conn.commit()
+            return True
+        except sqlite3.Error:
+            return False
+
+    # ---------- 报价处理意见语料 / 判断记录 ----------
+    def add_opinion_corpus(self, record: dict) -> int:
+        """写入一条意见语料；重复（同报案号+同意见）返回已有 id，失败返回 0"""
+        if self._conn is None:
+            return 0
+        claim_no = str(record.get("claim_no") or "").strip().upper()
+        dedup = str(record.get("dedup_hash") or "").strip()
+        if not claim_no or not dedup:
+            return 0
+        ts = str(record.get("captured_at") or "") or _iso(_now())
+        try:
+            with self._lock:
+                cur = self._conn.execute(
+                    "INSERT OR IGNORE INTO opinion_corpus"
+                    "(claim_no, staff_code, org_name, publish_time, opinion,"
+                    " opinion_note, return_eval, submit_path, prev_action,"
+                    " source, raw_json, captured_at, dedup_hash)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (claim_no,
+                     str(record.get("staff_code") or ""),
+                     str(record.get("org_name") or ""),
+                     str(record.get("publish_time") or ""),
+                     str(record.get("opinion") or ""),
+                     str(record.get("opinion_note") or ""),
+                     str(record.get("return_eval") or ""),
+                     str(record.get("submit_path") or ""),
+                     str(record.get("prev_action") or ""),
+                     str(record.get("source") or ""),
+                     str(record.get("raw_json") or ""),
+                     ts, dedup))
+                self._conn.commit()
+                if cur.rowcount:
+                    return int(cur.lastrowid or 0)
+                row = self._conn.execute(
+                    "SELECT id FROM opinion_corpus WHERE claim_no=? AND dedup_hash=?",
+                    (claim_no, dedup)).fetchone()
+                return int(row[0]) if row else 0
+        except sqlite3.Error:
+            return 0
+
+    def count_opinion_corpus(self) -> int:
+        if self._conn is None:
+            return 0
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) FROM opinion_corpus").fetchone()
+            return int(row[0]) if row else 0
+        except sqlite3.Error:
+            return 0
+
+    def iter_opinion_corpus(self) -> list[dict]:
+        """导出用：按采集时间倒序返回全部语料"""
+        if self._conn is None:
+            return []
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT id, claim_no, staff_code, org_name, publish_time,"
+                    " opinion, opinion_note, return_eval, submit_path,"
+                    " prev_action, source, captured_at FROM opinion_corpus"
+                    " ORDER BY captured_at DESC").fetchall()
+        except sqlite3.Error:
+            return []
+        keys = ("id", "claim_no", "staff_code", "org_name", "publish_time",
+                "opinion", "opinion_note", "return_eval", "submit_path",
+                "prev_action", "source", "captured_at")
+        return [dict(zip(keys, r)) for r in rows]
+
+    def add_opinion_prediction(self, record: dict) -> bool:
+        if self._conn is None:
+            return False
+        ts = str(record.get("ts") or "") or _iso(_now())
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO opinion_prediction"
+                    "(claim_no, corpus_id, action, confidence, model_version,"
+                    " decided_action, overridden_by, executed, ts)"
+                    " VALUES(?,?,?,?,?,?,?,?,?)",
+                    (str(record.get("claim_no") or ""),
+                     int(record.get("corpus_id") or 0),
+                     str(record.get("action") or "unknown"),
+                     float(record.get("confidence") or 0.0),
+                     str(record.get("model_version") or ""),
+                     str(record.get("decided_action") or ""),
+                     str(record.get("overridden_by") or ""),
+                     int(record.get("executed") or 0),
+                     ts))
                 self._conn.commit()
             return True
         except sqlite3.Error:

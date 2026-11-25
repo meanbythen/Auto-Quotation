@@ -18,6 +18,7 @@ from bot.logging_system import log_run, log_audit
 import bot.config as cfg
 from bot.page_objects import (
     step_home_click_claim,
+    step_read_opinion_and_decide,
     step_quote_open_loss_edit,
     step_loss_sync,
     step_loss_extract_data,
@@ -40,6 +41,7 @@ from bot.pricing.providers import get_providers
 
 STEP_NAMES = {
     "STEP 1": "首页 → 点击报案号",
+    "STEP 1.5": "报价处理 → 读取最新意见并判断（P0 只建议）",
     "STEP 2": "报价处理 → 点编辑打开定损平台",
     "STEP 3": "定损平台 → 同步定损",
     "STEP 4": "定损平台 → 提取 VIN + 换件列表",
@@ -325,6 +327,17 @@ async def run_claim_flow(env, ctx: dict, result: Optional[BotRunResult] = None,
             else:
                 raise
         ctx["quote_page"] = quote_page
+
+    # ==================== STEP 1.5: 读取报价处理意见（P0 只建议不执行） ====================
+    async with rec.step("STEP 1.5", STEP_NAMES["STEP 1.5"]):
+        await gate.checkpoint("STEP 1.5 读取报价处理意见并判断（只建议）")
+        decision = await step_read_opinion_and_decide(quote_page, ctx)
+        if decision.get("action") and decision["action"] != "unknown":
+            advice = (f"意见判断={decision.get('label')}"
+                      f"（置信度{float(decision.get('confidence') or 0):.2f}）")
+            ctx["opinion_advice_note"] = advice
+            result.messages.append(advice)
+            print(f"  🧠 建议动作: {advice}（P0 仅记录，不改变执行）")
 
     async with rec.step("STEP 2", STEP_NAMES["STEP 2"]) as st:
         await gate.checkpoint("STEP 2 报价处理 → 点编辑打开定损平台")

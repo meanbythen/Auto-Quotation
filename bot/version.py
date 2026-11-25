@@ -20,14 +20,25 @@ import sys
 from pathlib import Path
 
 APP_NAME = "理赔报价机器人"
-__version__ = "3.17.20"
-VERSION_TAG = "运行模式默认选中真实循环挂机"
+__version__ = "3.17.21"
+VERSION_TAG = "P0：报价处理意见采集与规则建议"
 
 
 # ============================================================
 # 变更记录（新的在最上面）
 # ============================================================
 CHANGELOG: list[dict] = [
+    {
+        "version": "3.17.21",
+        "date": "2026-11-25",
+        "title": "P0：报价处理意见采集与规则建议",
+        "changes": [
+            "新增 bot/intelligence 模块：reader 读取报价处理意见列表（表格/Element UI/时间线三级策略，有界轮询），policy 规则判断 7 类动作，collector 落库与 JSONL 导出",
+            "SQLite 新增 opinion_corpus / opinion_label / opinion_prediction 三张表；语料按「报案号+发表时间+意见+工号」去重",
+            "新增 STEP 1.5：进入报价页后读取最新意见并给出建议动作，台账备注写入判断结果",
+            "P0 只建议不执行：INTELLIGENCE_MODE 默认 advise，off 时行为与旧版完全一致",
+        ],
+    },
     {
         "version": "3.17.20",
         "date": "2026-11-24",

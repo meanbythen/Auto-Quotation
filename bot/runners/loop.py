@@ -351,7 +351,8 @@ async def _loop_body(env, spec: EnvSpec, *,
 
                 write_ledger(claim, result.vehicle, result.parts,
                              status="done",
-                             note="无换件案件" if route == "no_parts" else "")
+                             note=(ctx.get("opinion_advice_note")
+                                   or ("无换件案件" if route == "no_parts" else "")))
                 finalize_record(rec, status="done", route=route,
                                 data=snapshot(ctx, result, route))
 

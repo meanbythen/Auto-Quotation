@@ -4,6 +4,8 @@ from PyInstaller.utils.hooks import collect_all
 datas = [('mock_web', 'mock_web')]
 binaries = []
 hiddenimports = ['bot.capture', 'bot.capture.snapshot', 'bot.capture.actions', 'bot.runners.capture',
+                 'bot.intelligence', 'bot.intelligence.reader', 'bot.intelligence.rules',
+                 'bot.intelligence.collector', 'bot.intelligence.policy',
                  'openpyxl']
 tmp_ret = collect_all('playwright')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
