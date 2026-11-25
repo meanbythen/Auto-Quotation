@@ -91,6 +91,16 @@ TASK_TRANSFER_URL_ALTS = (
     "http://10.164.128.92/claimcar/32160/taskTransfer/TaskTransferQuery",
 )
 
+# ============ 真实内网：任务中心 - 我的任务 ============
+# 菜单：理赔作业门户 → 左侧『任务中心』→『我的任务』（与『平级移交』同级，折叠在悬浮弹层里）
+# 生产实测 data-url = /claimcar/myTask/Index；浏览器里的真实地址为 /claimcar/32180/myTask/index
+MY_TASK_URL = "http://10.164.128.92/claimcar/32180/myTask/index"
+MY_TASK_URL_ALT = "http://10.164.128.92/claimcar/myTask/Index"
+MY_TASK_URL_ALTS = (
+    "http://10.164.128.92/claimcar/32180/myTask/Index",
+    "http://10.164.128.92/claimcar/32170/myTask/index",
+)
+
 # ============ 一级报价权限：报价汇总『换件金额』超过该值 → 业务动作『提交上级』 ============
 HIGH_AMOUNT_THRESHOLD = 40000.0
 
