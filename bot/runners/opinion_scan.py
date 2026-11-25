@@ -2,7 +2,8 @@
 
 路径：理赔作业门户 → 左侧『任务中心』→『我的任务』
       → 流入时间「三月内」+ 状态「全部」→ 查询
-      → 逐条点报案号打开报价处理页 → 读取意见/意见说明 → 落库 → 返回列表
+      → 逐条点报案号打开报价处理页 → 逐行读取整张意见列表（角色/工号/时间/意见/说明/退回评价）
+      → 落库 → 关闭该标签页 → 下一个案件
 
 『我的任务』与『平级移交』同属任务中心子菜单，平时折叠在悬浮弹层里（display:none），
 按文字找可见元素永远找不到。因此和平级移交一样按三层方式打开：
@@ -495,7 +496,7 @@ async def _dialog_guard(get_pages, stop: asyncio.Event, interval: float = 0.8) -
 async def scan_my_tasks(page: Page, max_claims: int = 30,
                         stop_event=None, timeout: float = 8.0) -> dict:
     """批量采集我的任务里的报价处理意见；返回统计 dict"""
-    result = {"claims": 0, "with_opinion": 0, "saved": 0, "failed": 0}
+    result = {"claims": 0, "with_opinion": 0, "saved": 0, "failed": 0, "rows": 0}
     limit = max(1, int(max_claims))
 
     _log("采集意见 | 打开我的任务（任务中心 → 我的任务）")
@@ -561,13 +562,17 @@ async def _scan_loop(list_page: Page, limit: int, result: dict,
                 continue
             ok = True
             try:
-                opinion = await reader.read_latest_opinion(quote, timeout, claim_no=claim_no)
-                if opinion:
+                opinions = await reader.read_opinions(quote, timeout, claim_no=claim_no)
+                if opinions:
                     result["with_opinion"] += 1
-                    if collector.record_opinion(claim_no, opinion, source="scan"):
-                        result["saved"] += 1
-                    _log(f"采集意见 | [{idx}/{limit}] {claim_no} | "
-                         f"{reader.format_opinion(opinion)}")
+                    result["rows"] += len(opinions)
+                    got = 0
+                    for op in opinions:
+                        if collector.record_opinion(claim_no, op, source="scan"):
+                            got += 1
+                    result["saved"] += got
+                    _log(f"采集意见 | [{idx}/{limit}] {claim_no} | 意见 {len(opinions)} 行，"
+                         f"入库 {got} | 最新：{reader.format_opinion(opinions[0])}")
                 else:
                     _log(f"采集意见 | [{idx}/{limit}] {claim_no} | 无意见")
             except Exception as exc:
@@ -586,7 +591,7 @@ async def _scan_loop(list_page: Page, limit: int, result: dict,
 
 def _finish(result: dict) -> dict:
     _log(f"采集意见 | 完成：案件 {result['claims']} | 有意见 {result['with_opinion']} | "
-         f"入库 {result['saved']} | 失败 {result['failed']}")
+         f"意见行 {result.get('rows', 0)} | 入库 {result['saved']} | 失败 {result['failed']}")
     log_audit(f"采集意见完成 | 案件={result['claims']} 有意见={result['with_opinion']} "
-              f"入库={result['saved']} 失败={result['failed']}")
+              f"意见行={result.get('rows', 0)} 入库={result['saved']} 失败={result['failed']}")
     return result

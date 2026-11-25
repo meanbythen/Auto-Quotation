@@ -594,6 +594,61 @@ class PriceStore:
                 "prev_action", "source", "captured_at")
         return [dict(zip(keys, r)) for r in rows]
 
+    def iter_opinion_corpus_view(self, limit: int = 0) -> list[dict]:
+        """查看用：含角色/姓名（从 raw_json 解析），按发表时间倒序"""
+        if self._conn is None:
+            return []
+        sql = ("SELECT claim_no, staff_code, publish_time, opinion, opinion_note,"
+               " return_eval, org_name, source, captured_at, raw_json"
+               " FROM opinion_corpus ORDER BY publish_time DESC, id DESC")
+        args: tuple = ()
+        if limit and int(limit) > 0:
+            sql += " LIMIT ?"
+            args = (int(limit),)
+        try:
+            with self._lock:
+                rows = self._conn.execute(sql, args).fetchall()
+        except sqlite3.Error:
+            return []
+        out: list[dict] = []
+        for r in rows:
+            role = name = ""
+            try:
+                raw = json.loads(r[9] or "{}")
+                role = str(raw.get("role") or "")
+                name = str(raw.get("name") or "")
+            except Exception:
+                pass
+            out.append({
+                "claim_no": r[0] or "", "staff_code": r[1] or "",
+                "publish_time": r[2] or "", "opinion": r[3] or "",
+                "opinion_note": r[4] or "", "return_eval": r[5] or "",
+                "org_name": r[6] or "", "source": r[7] or "",
+                "captured_at": r[8] or "", "role": role, "name": name,
+            })
+        return out
+
+    def clear_opinion_data(self) -> dict:
+        """清空意见语料/标签/判断三张表，返回各表删除行数（不动零件价格缓存）"""
+        stats = {"corpus": 0, "labels": 0, "predictions": 0}
+        if self._conn is None:
+            return stats
+        try:
+            with self._lock:
+                for key, table in (("labels", "opinion_label"),
+                                   ("predictions", "opinion_prediction"),
+                                   ("corpus", "opinion_corpus")):
+                    cur = self._conn.execute(f"DELETE FROM {table}")
+                    stats[key] = int(cur.rowcount or 0)
+                self._conn.commit()
+                try:
+                    self._conn.execute("VACUUM")
+                except sqlite3.Error:
+                    pass
+        except sqlite3.Error:
+            pass
+        return stats
+
     def add_opinion_prediction(self, record: dict) -> bool:
         if self._conn is None:
             return False

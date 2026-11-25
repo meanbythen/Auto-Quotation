@@ -191,6 +191,71 @@ def _latest(opinions: list[dict]) -> tuple[Optional[dict], bool]:
     return opinions[-1], True
 
 
+def _rows_to_opinions(info: dict) -> tuple[list[dict], list[str]]:
+    """把提取到的原始行映射成结构化意见列表（保持页面顺序）"""
+    headers = [str(h or "") for h in (info.get("headers") or [])]
+    opinions: list[dict] = []
+    for item in info.get("rows") or []:
+        cells = [str(c or "") for c in (item.get("cells") or [])]
+        text = str(item.get("text") or "").strip()
+        row = _map_fields(headers, cells)
+        row["raw_text"] = text
+        if not row.get("opinion") and not row.get("opinion_note"):
+            row["opinion"] = text
+        if not (row.get("opinion") or row.get("opinion_note") or row.get("return_eval")):
+            continue
+        opinions.append(row)
+    return opinions, headers
+
+
+async def read_opinions(page: Page, timeout: float = 8.0,
+                        claim_no: str = "") -> list[dict]:
+    """读取整张『意见列表』（逐行，不只最新一条）
+
+    返回按发表时间倒序的意见列表；时间有解析不了的就保持页面顺序并标记
+    order_uncertain。没有意见或读不到返回 []，不抛异常。
+    """
+    deadline = time.time() + max(0.5, float(timeout))
+    info: Optional[dict] = None
+    while True:
+        info = await _extract(page)
+        if info and info.get("rows"):
+            break
+        if time.time() >= deadline:
+            break
+        await asyncio.sleep(0.5)
+
+    if not info or not info.get("rows"):
+        seen = await _diagnose(page)
+        log_run(f"意见列表未读取到 | 报案号={claim_no or '?'} | 可见表头={seen or '无'}")
+        return []
+
+    opinions, headers = _rows_to_opinions(info)
+    if not opinions:
+        log_run(f"意见列表为空 | 报案号={claim_no or '?'} | 表头={headers} | "
+                f"类型={info.get('kind')}")
+        return []
+
+    paired = [(i, _parse_time(o.get("publish_time", ""))) for i, o in enumerate(opinions)]
+    parsed = [(i, ts) for i, ts in paired if ts is not None]
+    order_uncertain = len(parsed) < len(paired)
+    if parsed and not order_uncertain:
+        order = [i for i, _ in sorted(paired, key=lambda x: (x[1], x[0]), reverse=True)]
+    else:
+        order = list(range(len(opinions)))
+
+    out: list[dict] = []
+    for idx in order:
+        row = opinions[idx]
+        row["order_uncertain"] = order_uncertain
+        row["row_index"] = idx
+        row["row_count"] = len(opinions)
+        row["source_kind"] = str(info.get("kind") or "")
+        row["headers"] = headers
+        out.append(row)
+    return out
+
+
 async def read_latest_opinion(page: Page, timeout: float = 8.0,
                               claim_no: str = "") -> Optional[dict]:
     """读取并返回最新一条意见（结构化 dict）；无意见/读不到返回 None"""
@@ -209,19 +274,7 @@ async def read_latest_opinion(page: Page, timeout: float = 8.0,
         log_run(f"意见列表未读取到 | 报案号={claim_no or '?'} | 可见表头={seen or '无'}")
         return None
 
-    headers = [str(h or "") for h in (info.get("headers") or [])]
-    opinions: list[dict] = []
-    for item in info.get("rows") or []:
-        cells = [str(c or "") for c in (item.get("cells") or [])]
-        text = str(item.get("text") or "").strip()
-        row = _map_fields(headers, cells)
-        row["raw_text"] = text
-        if not row.get("opinion") and not row.get("opinion_note"):
-            row["opinion"] = text
-        if not (row.get("opinion") or row.get("opinion_note") or row.get("return_eval")):
-            continue
-        opinions.append(row)
-
+    opinions, headers = _rows_to_opinions(info)
     latest, order_uncertain = _latest(opinions)
     if not latest:
         log_run(f"意见列表为空 | 报案号={claim_no or '?'} | 表头={headers} | 类型={info.get('kind')}")

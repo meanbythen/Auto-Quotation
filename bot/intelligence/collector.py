@@ -119,6 +119,24 @@ def stats() -> dict:
                 "rule_hits": 0, "rule_hit_rate": 0.0}
 
 
+def list_all(limit: int = 0) -> list[dict]:
+    """查看用：返回已采集意见（含角色/姓名），按发表时间倒序"""
+    try:
+        return _store().iter_opinion_corpus_view(limit)
+    except Exception as exc:
+        log_error("读取意见数据失败", exc)
+        return []
+
+
+def clear_all() -> dict:
+    """清空意见语料、标签、判断记录；返回各表删除行数"""
+    try:
+        return _store().clear_opinion_data()
+    except Exception as exc:
+        log_error("清空意见数据失败", exc)
+        return {"corpus": 0, "labels": 0, "predictions": 0}
+
+
 def export_training_set(out_path: Optional[Path] = None) -> Optional[Path]:
     """导出已标注语料为训练集 JSONL；无标签时返回 None"""
     try:

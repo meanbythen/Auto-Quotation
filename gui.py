@@ -237,6 +237,183 @@ def export_parts_xlsx(path: str, rows) -> int:
     return n
 
 
+class OpinionViewer(tk.Toplevel):
+    """查看已采集的报价处理意见：可搜索、可看全文"""
+
+    COLS = [
+        ("publish_time", "发表时间", 145),
+        ("claim_no", "报案号", 205),
+        ("role", "角色", 66),
+        ("name", "姓名", 76),
+        ("staff_code", "工号", 88),
+        ("opinion", "意见", 120),
+        ("opinion_note", "意见说明", 320),
+        ("return_eval", "退回评价", 210),
+        ("source", "来源", 56),
+    ]
+
+    def __init__(self, master, loader):
+        super().__init__(master)
+        self.loader = loader
+        self.rows: list[dict] = []
+        self.title("📋 采集到的报价处理意见")
+        w, h = 1280, 700
+        try:
+            x = master.winfo_rootx() + max(0, (master.winfo_width() - w) // 2)
+            y = master.winfo_rooty() + max(0, (master.winfo_height() - h) // 2)
+        except Exception:
+            x = y = 80
+        self.geometry(f"{w}x{h}+{max(0, x)}+{max(0, y)}")
+        self.minsize(900, 460)
+        self.configure(bg=BG)
+
+        # ---- 顶部工具条 ----
+        bar = tk.Frame(self, bg=BG)
+        bar.pack(fill="x", padx=12, pady=(10, 6))
+        tk.Label(bar, text="搜索", bg=BG, fg=TEXT_MUTED,
+                 font=("Segoe UI", 9)).pack(side="left")
+        self.search_var = tk.StringVar()
+        entry = tk.Entry(bar, textvariable=self.search_var, bg=SURFACE, fg=TEXT,
+                         insertbackground=TEXT, relief="flat",
+                         font=("Microsoft YaHei UI", 9), width=36)
+        entry.pack(side="left", padx=(6, 8), ipady=3)
+        tk.Label(bar, text="报案号 / 工号 / 角色 / 意见 / 说明", bg=BG, fg=TEXT_DIM,
+                 font=("Segoe UI", 8)).pack(side="left")
+        tk.Button(bar, text="🔄 刷新", command=self.refresh, bg=SURFACE_2, fg=TEXT,
+                  activebackground=BORDER, activeforeground=TEXT, relief="flat", bd=0,
+                  padx=12, pady=3, cursor="hand2",
+                  font=("Segoe UI Semibold", 9)).pack(side="right")
+        self.count_var = tk.StringVar(value="")
+        tk.Label(bar, textvariable=self.count_var, bg=BG, fg=ACCENT,
+                 font=("Segoe UI Semibold", 9)).pack(side="right", padx=(0, 10))
+
+        # ---- 表格 ----
+        st = ttk.Style()
+        st.configure("OV.Treeview", background=SURFACE, fieldbackground=SURFACE,
+                     foreground=TEXT, rowheight=23, borderwidth=0,
+                     font=("Microsoft YaHei UI", 9))
+        st.configure("OV.Treeview.Heading", background=SURFACE_2, foreground=TEXT_MUTED,
+                     font=("Segoe UI Semibold", 9), relief="flat")
+        st.map("OV.Treeview", background=[("selected", SURFACE_2)],
+               foreground=[("selected", ACCENT)])
+
+        box = tk.Frame(self, bg=BG)
+        box.pack(fill="both", expand=True, padx=12)
+        keys = [c[0] for c in self.COLS]
+        self.tree = ttk.Treeview(box, columns=keys, show="headings",
+                                 style="OV.Treeview", selectmode="browse")
+        for key, title, width in self.COLS:
+            self.tree.heading(key, text=title, anchor="w")
+            self.tree.column(key, width=width, minwidth=50, anchor="w", stretch=False)
+        ysb = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
+        xsb = ttk.Scrollbar(box, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        ysb.grid(row=0, column=1, sticky="ns")
+        xsb.grid(row=1, column=0, sticky="ew")
+        box.rowconfigure(0, weight=1)
+        box.columnconfigure(0, weight=1)
+        self.tree.tag_configure("quote", foreground=ACCENT)
+        self.tree.tag_configure("check", foreground=WARNING)
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self._show_detail())
+        self.tree.bind("<Double-1>", self._open_full)
+
+        # ---- 底部详情 ----
+        self.detail_var = tk.StringVar(value="选中一行查看完整意见；双击查看全文")
+        detail = tk.Label(self, textvariable=self.detail_var, bg=SURFACE, fg=TEXT_MUTED,
+                          font=("Microsoft YaHei UI", 9), anchor="w", justify="left",
+                          padx=10, pady=6)
+        detail.pack(fill="x", padx=12, pady=(6, 10))
+        self.bind("<Configure>", lambda e: detail.configure(
+            wraplength=max(300, e.width - 60)) if e.widget is self else None)
+
+        self.search_var.trace_add("write", lambda *_: self._apply())
+        self.refresh()
+
+    # ---------- 数据 ----------
+    def refresh(self):
+        try:
+            self.rows = self.loader() or []
+        except Exception:
+            self.rows = []
+        self._apply()
+
+    def _apply(self):
+        kw = (self.search_var.get() or "").strip().lower()
+        self.tree.delete(*self.tree.get_children())
+        shown = 0
+        for i, r in enumerate(self.rows):
+            blob = " ".join(str(r.get(k) or "") for k in
+                            ("claim_no", "staff_code", "role", "name", "opinion",
+                             "opinion_note", "return_eval", "org_name")).lower()
+            if kw and kw not in blob:
+                continue
+            role = str(r.get("role") or "")
+            tag = ("quote",) if "报价" in role else (("check",) if "核损" in role else ())
+            self.tree.insert("", "end", iid=str(i), tags=tag, values=[
+                r.get("publish_time", ""), r.get("claim_no", ""), role,
+                r.get("name", ""), r.get("staff_code", ""), r.get("opinion", ""),
+                r.get("opinion_note", ""), r.get("return_eval", ""),
+                r.get("source", ""),
+            ])
+            shown += 1
+        claims = len({r.get("claim_no") for r in self.rows if r.get("claim_no")})
+        self.count_var.set(f"共 {len(self.rows)} 条 / 案件 {claims} 个"
+                           + (f"　筛选后 {shown} 条" if kw else ""))
+
+    def _selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        try:
+            return self.rows[int(sel[0])]
+        except Exception:
+            return None
+
+    def _show_detail(self):
+        r = self._selected()
+        if not r:
+            return
+        parts = [f"{r.get('publish_time','')} · {r.get('role','')} {r.get('name','')}"
+                 f"({r.get('staff_code','')}) · {r.get('org_name','')}"]
+        if r.get("opinion"):
+            parts.append(f"意见：{r['opinion']}")
+        if r.get("opinion_note"):
+            parts.append(f"说明：{r['opinion_note']}")
+        if r.get("return_eval"):
+            parts.append(f"评价：{r['return_eval']}")
+        parts.append(f"采集：{str(r.get('captured_at','')).replace('T',' ')}")
+        self.detail_var.set("　|　".join(parts))
+
+    def _open_full(self, _evt=None):
+        r = self._selected()
+        if not r:
+            return
+        win = tk.Toplevel(self)
+        win.title(f"意见全文 · {r.get('claim_no','')}")
+        win.geometry("760x420")
+        win.configure(bg=BG)
+        text = tk.Text(win, bg=SURFACE, fg=TEXT, relief="flat", wrap="word",
+                       font=("Microsoft YaHei UI", 10), padx=12, pady=10,
+                       insertbackground=TEXT)
+        text.pack(fill="both", expand=True, padx=12, pady=12)
+        text.insert("end", "\n".join([
+            f"报案号：{r.get('claim_no','')}",
+            f"发表时间：{r.get('publish_time','')}",
+            f"角色/姓名/工号：{r.get('role','')} / {r.get('name','')} / {r.get('staff_code','')}",
+            f"机构：{r.get('org_name','')}",
+            "",
+            f"意见：{r.get('opinion','')}",
+            "",
+            f"意见说明：{r.get('opinion_note','')}",
+            "",
+            f"退回评价：{r.get('return_eval','')}",
+            "",
+            f"来源：{r.get('source','')}　采集时间：{str(r.get('captured_at','')).replace('T',' ')}",
+        ]))
+        text.configure(state="disabled")
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -581,6 +758,12 @@ class App:
         self.collect_btn = self._make_btn(btns, "🧾 采集意见", ACCENT, SURFACE_2,
                                           self.on_collect_opinions)
         self.collect_btn.pack(side="left", padx=(8, 0))
+        self.clear_opinion_btn = self._make_btn(btns, "🗑 清空意见", DANGER, SURFACE_2,
+                                                self.on_clear_opinions)
+        self.clear_opinion_btn.pack(side="left", padx=(8, 0))
+        self.view_opinion_btn = self._make_btn(btns, "📋 查看意见", SURFACE_2, BORDER,
+                                               self.on_view_opinions)
+        self.view_opinion_btn.pack(side="left", padx=(8, 0))
 
         # ---------- 🧠 学习模式（某步失败 → 暂停等你手动处理 → 存技能） ----------
         learn = tk.Frame(card, bg=SURFACE)
@@ -2290,6 +2473,11 @@ class App:
                     text="🧾 采集意见", bg=ACCENT, fg=SURFACE_2,
                     state="normal" if browser_open and not scanning else "disabled")
 
+        clear_btn = self._ui("clear_opinion_btn")
+        if clear_btn is not None:
+            busy = bool(getattr(self, "_collect_active", False)) or scanning
+            clear_btn.configure(state="disabled" if busy else "normal")
+
         # 单步/人工测试运行中禁用挂机相关按钮
         if self.is_running and self._loop_env is None:
             start.configure(state="disabled")
@@ -2444,8 +2632,71 @@ class App:
         r = res or {}
         self._set_status(
             f"采集完成：案件 {r.get('claims', 0)} | 有意见 {r.get('with_opinion', 0)}"
-            f" | 入库 {r.get('saved', 0)} | 失败 {r.get('failed', 0)}", SUCCESS)
+            f" | 意见行 {r.get('rows', 0)} | 入库 {r.get('saved', 0)}"
+            f" | 失败 {r.get('failed', 0)}", SUCCESS)
         log_run(f"采集意见完成：{r}")
+        win = getattr(self, "_opinion_viewer", None)
+        try:
+            if win is not None and win.winfo_exists():
+                win.refresh()
+        except Exception:
+            pass
+
+    # ---------- 回调 5: clear_opinion_btn（🗑 清空意见）----------
+    def on_clear_opinions(self):
+        """清空已采集的意见语料/标签/判断记录（不动零件价格缓存）"""
+        if getattr(self, "_collect_active", False) or self._scan_active:
+            messagebox.showinfo("清空意见", "正在采集或扫描中，请先停止再清空。")
+            return
+        from bot.intelligence import collector
+        try:
+            s = collector.stats()
+        except Exception:
+            s = {"corpus": 0, "labels": 0, "predictions": 0}
+        if not (s.get("corpus") or s.get("labels") or s.get("predictions")):
+            messagebox.showinfo("清空意见", "当前没有采集到的意见数据，无需清空。")
+            return
+        ok = messagebox.askyesno(
+            "清空意见",
+            "将删除已采集的意见数据：\n"
+            f"　语料 {s.get('corpus', 0)} 条\n"
+            f"　标签 {s.get('labels', 0)} 条\n"
+            f"　判断记录 {s.get('predictions', 0)} 条\n\n"
+            "零件价格缓存与工作记录不受影响。\n删除后不可恢复，确定继续？")
+        if not ok:
+            return
+        try:
+            res = collector.clear_all()
+        except Exception as exc:
+            log_error("清空意见数据失败", exc)
+            messagebox.showerror("清空意见", f"清空失败：{exc}")
+            return
+        log_audit(f"清空意见数据 | 语料={res.get('corpus', 0)} 标签={res.get('labels', 0)} "
+                  f"判断={res.get('predictions', 0)}")
+        messagebox.showinfo(
+            "清空意见",
+            f"已清空：语料 {res.get('corpus', 0)} 条、标签 {res.get('labels', 0)} 条、"
+            f"判断记录 {res.get('predictions', 0)} 条。")
+        self._set_status("已清空意见数据，可重新采集", SUCCESS)
+
+    # ---------- 回调 6: view_opinion_btn（📋 查看意见）----------
+    def on_view_opinions(self):
+        """查看已采集的意见（独立窗口，可搜索）"""
+        from bot.intelligence import collector
+        win = getattr(self, "_opinion_viewer", None)
+        try:
+            if win is not None and win.winfo_exists():
+                win.lift()
+                win.focus_force()
+                win.refresh()
+                return
+        except Exception:
+            pass
+        try:
+            self._opinion_viewer = OpinionViewer(self.root, collector.list_all)
+        except Exception as exc:
+            log_error("打开意见查看窗口失败", exc)
+            messagebox.showerror("查看意见", f"打开失败：{exc}")
 
     # ---------- 具体动作：拉起浏览器 / 关浏览器 / 开始扫描 / 停止扫描 ----------
     def _open_browser_and_wait_login(self):
