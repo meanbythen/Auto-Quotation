@@ -38,6 +38,9 @@ INTELLIGENCE_SOURCE = "hang"
 # 意见列表通常异步渲染，读取采用有界轮询
 INTELLIGENCE_READ_TIMEOUT = float(os.environ.get("BOT_INTELLIGENCE_READ_TIMEOUT", "8"))
 
+# 扫描报案号：列表为空时默认只等待异步加载，不点击『查询』触发整页重新查询
+SCAN_ALLOW_QUERY_CLICK = os.environ.get("BOT_SCAN_QUERY_CLICK", "0").strip() == "1"
+
 # ============ 本地模拟服务器（理赔门户内网限制，只能 mock） ============
 MOCK_SERVER_HOST = "127.0.0.1"
 MOCK_SERVER_PORT = 8765

@@ -1545,27 +1545,40 @@ async def step_home_list_claims(page: Page, context: dict, **kwargs) -> list:
             print(f"  [i] 未匹配到表格结构，改用页面文本提取报案号（{len(found)} 个）")
             claims = [{"claim_no": c, "status": "", "el": None} for c in found]
 
-    # 策略 4：还是 0 个 → 可能是列表靠『查询』按钮异步加载 / 页面停在别的 tab
+    # 策略 4：还是 0 个 → 先等列表异步加载；默认不点『查询』，避免整页重新查询
     if not claims:
         await _dump_empty_list_diag(page)
-        try:
-            for sel in ["button:has-text('查询')", "input[value='查询']",
-                        "a:has-text('查询')", "button:has-text('搜索')"]:
-                loc = page.locator(sel).first
-                if await loc.count() > 0 and await loc.is_visible():
-                    print(f"  [i] 列表为空，尝试点击『查询』({sel}) 重新加载")
-                    await loc.click()
-                    await page.wait_for_load_state("networkidle")
-                    await asyncio.sleep(2)
-                    found = await find_claim_rows(page)
-                    if found:
-                        print(f"  [i] 点击『查询』后读取到 {len(found)} 个报案号")
-                        claims = [{"claim_no": c, "status": "", "el": None} for c in found]
+        if cfg.SCAN_ALLOW_QUERY_CLICK:
+            try:
+                for sel in ["button:has-text('查询')", "input[value='查询']",
+                            "a:has-text('查询')", "button:has-text('搜索')"]:
+                    loc = page.locator(sel).first
+                    if await loc.count() > 0 and await loc.is_visible():
+                        print(f"  [i] 列表为空，按配置点击『查询』({sel}) 重新加载")
+                        await loc.click()
+                        await page.wait_for_load_state("networkidle")
+                        await asyncio.sleep(2)
+                        found = await find_claim_rows(page)
+                        if found:
+                            print(f"  [i] 点击『查询』后读取到 {len(found)} 个报案号")
+                            claims = [{"claim_no": c, "status": "", "el": None} for c in found]
+                        break
+            except Exception as exc:
+                print(f"  [!] 点击『查询』失败: {exc}")
+        else:
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                await asyncio.sleep(0.5)
+                found = await find_claim_rows(page)
+                if found:
+                    print(f"  [i] 等待列表加载后读取到 {len(found)} 个报案号（未点击『查询』）")
+                    claims = [{"claim_no": c, "status": "", "el": None} for c in found]
                     break
-        except Exception as exc:
-            print(f"  [!] 点击『查询』失败: {exc}")
+            else:
+                print("  [i] 等待列表加载超时（未点击『查询』，改走菜单兜底）")
+                log_audit("扫描报案号：等待列表加载超时，未点击『查询』")
 
-    # 策略 4：真实门户常把案件放在『我的案件 / 待办案件』菜单里，首页只显示待办小组件
+    # 策略 5：真实门户常把案件放在『我的案件 / 待办案件』菜单里，首页只显示待办小组件
     if not claims:
         for label in ("我的案件", "待办案件", "待处理", "案件列表", "待办事宜"):
             try:
