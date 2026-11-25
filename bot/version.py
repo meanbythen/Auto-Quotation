@@ -20,14 +20,38 @@ import sys
 from pathlib import Path
 
 APP_NAME = "理赔报价机器人"
-__version__ = "3.17.24"
-VERSION_TAG = "P2：离线模型接入与自动跳过"
+__version__ = "3.17.26"
+VERSION_TAG = "P4：低碳信息列表采集"
 
 
 # ============================================================
 # 变更记录（新的在最上面）
 # ============================================================
 CHANGELOG: list[dict] = [
+    {
+        "version": "3.17.26",
+        "date": "2026-11-25",
+        "title": "P4：低碳信息列表采集",
+        "changes": [
+            "新增 bot/intelligence/low_carbon.py：定位「低碳信息」页签 → 解析配件表 → 切回定损页签",
+            "新增 STEP 3.5：同步定损后采集低碳列表，结果落库 low_carbon_parts，不改变报价流程",
+            "低碳列表为空时明确记录「按普通配件流程」；未找到入口或采集失败只记日志，不阻断主流程",
+            "新增开关 BOT_LOW_CARBON_COLLECT=0 关闭采集",
+            "python -m bot.intelligence.low_carbon 查看已采集的案件数与配件数",
+        ],
+    },
+    {
+        "version": "3.17.25",
+        "date": "2026-11-25",
+        "title": "P3：UI 元素缓存与定位加速",
+        "changes": [
+            "新增 bot/intelligence/element_cache.py：按「页面范围 + 操作 label + 选择器集合签名」记住成功命中的选择器",
+            "find_clickable 先试缓存选择器，失败立即回退原有选择器/文字扫描，不影响定位正确性",
+            "新增 ui_element_cache 表，记录命中/未命中次数与最近成功时间，默认 30 天 TTL",
+            "新增开关 BOT_ELEMENT_CACHE=0 关闭缓存、BOT_ELEMENT_CACHE_TTL 调整有效期",
+            "python -m bot.intelligence.element_cache 可查看缓存条数、命中率并清理过期记录",
+        ],
+    },
     {
         "version": "3.17.24",
         "date": "2026-11-25",

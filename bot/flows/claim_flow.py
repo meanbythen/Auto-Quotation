@@ -21,6 +21,7 @@ from bot.page_objects import (
     step_read_opinion_and_decide,
     step_quote_open_loss_edit,
     step_loss_sync,
+    step_loss_collect_low_carbon,
     step_loss_extract_data,
     step_loss_cancel_direct_supply,
     step_market_vin_search,
@@ -44,6 +45,7 @@ STEP_NAMES = {
     "STEP 1.5": "报价处理 → 读取最新意见并判断（P0 只建议）",
     "STEP 2": "报价处理 → 点编辑打开定损平台",
     "STEP 3": "定损平台 → 同步定损",
+    "STEP 3.5": "定损平台 → 采集低碳信息列表（只采集）",
     "STEP 4": "定损平台 → 提取 VIN + 换件列表",
     "STEP 5": "一车一件 → VIN 查询",
     "STEP 6": "一车一件 → 逐个零件查市场价",
@@ -376,6 +378,15 @@ async def run_claim_flow(env, ctx: dict, result: Optional[BotRunResult] = None,
                 await step_loss_sync(loss_page, ctx)
             else:
                 raise
+
+    # ==================== STEP 3.5: 低碳信息列表（只采集，不改变流程） ====================
+    async with rec.step("STEP 3.5", STEP_NAMES["STEP 3.5"]):
+        await gate.checkpoint("STEP 3.5 采集低碳信息列表（只采集）")
+        try:
+            await step_loss_collect_low_carbon(loss_page, ctx)
+        except Exception as exc:
+            print(f"  [!] 低碳信息采集异常（不影响主流程）: {exc}")
+            log_run(f"低碳信息采集异常（忽略）: {exc}")
 
     async with rec.step("STEP 4", STEP_NAMES["STEP 4"]) as st:
         await gate.checkpoint("STEP 4 定损平台 → 提取 VIN + 换件列表")

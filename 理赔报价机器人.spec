@@ -7,7 +7,8 @@ hiddenimports = ['bot.capture', 'bot.capture.snapshot', 'bot.capture.actions', '
                  'bot.intelligence', 'bot.intelligence.reader', 'bot.intelligence.rules',
                  'bot.intelligence.collector', 'bot.intelligence.policy',
                  'bot.intelligence.confirm', 'bot.intelligence.model',
-                 'bot.intelligence.train',
+                 'bot.intelligence.train', 'bot.intelligence.element_cache',
+                 'bot.intelligence.low_carbon',
                  'openpyxl']
 tmp_ret = collect_all('playwright')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]

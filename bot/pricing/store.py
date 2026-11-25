@@ -124,6 +124,32 @@ CREATE TABLE IF NOT EXISTS opinion_prediction (
 
 CREATE INDEX IF NOT EXISTS idx_opinion_corpus_claim ON opinion_corpus(claim_no);
 CREATE INDEX IF NOT EXISTS idx_opinion_prediction_ts ON opinion_prediction(ts DESC);
+
+-- 低碳信息列表（P4 只采集）
+CREATE TABLE IF NOT EXISTS low_carbon_parts (
+    claim_no    TEXT NOT NULL,
+    part_code   TEXT NOT NULL,
+    part_name   TEXT NOT NULL,
+    qty         TEXT DEFAULT '',
+    price       TEXT DEFAULT '',
+    raw_json    TEXT DEFAULT '',
+    captured_at TEXT NOT NULL,
+    PRIMARY KEY(claim_no, part_code, part_name)
+);
+CREATE INDEX IF NOT EXISTS idx_low_carbon_ts ON low_carbon_parts(captured_at DESC);
+
+-- UI 元素缓存：某页面范围内某操作成功命中的选择器，下次优先尝试
+CREATE TABLE IF NOT EXISTS ui_element_cache (
+    scope      TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    selector   TEXT NOT NULL,
+    hits       INTEGER DEFAULT 0,
+    misses     INTEGER DEFAULT 0,
+    ok_at      TEXT DEFAULT '',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (scope, key, selector)
+);
+CREATE INDEX IF NOT EXISTS idx_ui_cache_lookup ON ui_element_cache(scope, key, ok_at DESC);
 """
 
 
@@ -668,6 +694,129 @@ class PriceStore:
         if result["predictions"]:
             result["rule_hit_rate"] = round(
                 result["rule_hits"] / result["predictions"], 4)
+        return result
+
+    # ---------- 低碳信息列表 ----------
+    def add_low_carbon_parts(self, claim_no: str, items: list[dict]) -> int:
+        claim_no = str(claim_no or "").strip().upper()
+        if self._conn is None or not claim_no or not items:
+            return 0
+        ts = _iso(_now())
+        rows = [
+            (claim_no,
+             str(it.get("part_code") or ""),
+             str(it.get("part_name") or ""),
+             str(it.get("qty") or ""),
+             str(it.get("price") or ""),
+             str(it.get("raw_json") or ""),
+             ts)
+            for it in items
+        ]
+        try:
+            with self._lock:
+                self._conn.executemany(
+                    "INSERT OR REPLACE INTO low_carbon_parts"
+                    "(claim_no, part_code, part_name, qty, price, raw_json, captured_at)"
+                    " VALUES(?,?,?,?,?,?,?)", rows)
+                self._conn.commit()
+            return len(rows)
+        except sqlite3.Error:
+            return 0
+
+    def low_carbon_stats(self) -> dict:
+        result = {"claims": 0, "parts": 0}
+        if self._conn is None:
+            return result
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT COUNT(DISTINCT claim_no), COUNT(*) FROM low_carbon_parts").fetchone()
+        except sqlite3.Error:
+            return result
+        if row:
+            result.update(claims=int(row[0]), parts=int(row[1]))
+        return result
+
+    # ---------- UI 元素缓存 ----------
+    def get_ui_selectors(self, scope: str, key: str, limit: int = 2,
+                         ttl_days: int = 30) -> list[str]:
+        """返回近期成功过的选择器，最近成功的排前面"""
+        if self._conn is None or not scope or not key:
+            return []
+        cutoff = _iso(_now() - timedelta(days=ttl_days))
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT selector FROM ui_element_cache"
+                    " WHERE scope=? AND key=? AND ok_at>=?"
+                    " ORDER BY ok_at DESC, hits DESC LIMIT ?",
+                    (scope, key, cutoff, max(1, int(limit)))).fetchall()
+            return [r[0] for r in rows]
+        except sqlite3.Error:
+            return []
+
+    def touch_ui_success(self, scope: str, key: str, selector: str,
+                         reused: int = 0) -> None:
+        if self._conn is None or not (scope and key and selector):
+            return
+        ts = _iso(_now())
+        reused = 1 if reused else 0
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO ui_element_cache"
+                    "(scope, key, selector, hits, misses, ok_at, updated_at)"
+                    " VALUES(?,?,?,?,0,?,?)"
+                    " ON CONFLICT(scope, key, selector) DO UPDATE SET"
+                    " hits=hits+excluded.hits, ok_at=excluded.ok_at,"
+                    " updated_at=excluded.updated_at",
+                    (scope, key, selector, reused, ts, ts))
+                self._conn.commit()
+        except sqlite3.Error:
+            pass
+
+    def touch_ui_miss(self, scope: str, key: str, selector: str) -> None:
+        if self._conn is None or not (scope and key and selector):
+            return
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE ui_element_cache SET misses=misses+1, updated_at=?"
+                    " WHERE scope=? AND key=? AND selector=?",
+                    (_iso(_now()), scope, key, selector))
+                self._conn.commit()
+        except sqlite3.Error:
+            pass
+
+    def prune_ui_cache(self, ttl_days: int = 30) -> int:
+        if self._conn is None:
+            return 0
+        cutoff = _iso(_now() - timedelta(days=ttl_days))
+        try:
+            with self._lock:
+                cur = self._conn.execute(
+                    "DELETE FROM ui_element_cache WHERE updated_at<?", (cutoff,))
+                self._conn.commit()
+            return int(cur.rowcount or 0)
+        except sqlite3.Error:
+            return 0
+
+    def ui_cache_stats(self) -> dict:
+        result = {"entries": 0, "hits": 0, "misses": 0, "hit_rate": 0.0}
+        if self._conn is None:
+            return result
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(hits),0), COALESCE(SUM(misses),0)"
+                    " FROM ui_element_cache").fetchone()
+        except sqlite3.Error:
+            return result
+        if row:
+            result.update(entries=int(row[0]), hits=int(row[1]), misses=int(row[2]))
+            total = result["hits"] + result["misses"]
+            if total:
+                result["hit_rate"] = round(result["hits"] / total, 4)
         return result
 
     # ---------- 因蓝色/纯橙色退回过的报案号（二次进入按正常案件处理） ----------

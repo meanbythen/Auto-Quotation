@@ -37,6 +37,11 @@ INTELLIGENCE_CONFIRM_THRESHOLD = 0.55
 INTELLIGENCE_MODEL_AUTO_THRESHOLD = float(os.environ.get("BOT_INTELLIGENCE_MODEL_AUTO", "0.70"))
 # auto 模式是否允许「等待资料 / 无需处理」直接跳过本案件
 INTELLIGENCE_AUTO_SKIP_HOLD = os.environ.get("BOT_INTELLIGENCE_AUTO_SKIP", "1").strip() == "1"
+# UI 元素缓存：记录成功命中过的选择器，下次优先尝试；失败自动回退正常扫描
+ELEMENT_CACHE_ENABLED = os.environ.get("BOT_ELEMENT_CACHE", "1").strip() == "1"
+ELEMENT_CACHE_TTL_DAYS = int(os.environ.get("BOT_ELEMENT_CACHE_TTL", "30"))
+# 低碳信息：P4 只采集列表并落库，不改变报价流程
+LOW_CARBON_COLLECT = os.environ.get("BOT_LOW_CARBON_COLLECT", "1").strip() == "1"
 INTELLIGENCE_COLLECT = True          # 挂机随单采集语料
 INTELLIGENCE_SOURCE = "hang"
 # 意见列表通常异步渲染，读取采用有界轮询

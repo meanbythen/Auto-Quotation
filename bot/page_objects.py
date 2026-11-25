@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 import asyncio
+import hashlib
 import random
 import re
 import threading as _th
@@ -154,6 +155,44 @@ async def find_clickable(page: Page, selectors: Sequence[str], keywords: Sequenc
     真实门户的「编辑」「提交」都在页面下方，需要滚动才看得见，这里统一 scrollIntoView。
     """
     deadline = time.time() + timeout / 1000.0
+    cache_mod = None
+    cache_scope = ""
+    cache_key = ""
+    cached: list[str] = []
+    if label:
+        # 同一页面可能多处用同名 label，用选择器集合签名区分，避免串用
+        sig = hashlib.md5(("|".join(selectors)).encode("utf-8")).hexdigest()[:8]
+        cache_key = f"{label}#{sig}"
+        try:
+            from bot.intelligence import element_cache as cache_mod
+            if cache_mod.enabled():
+                cache_scope = cache_mod.scope_for(page)
+                cached = cache_mod.candidates(cache_scope, cache_key)
+        except Exception:
+            cache_mod, cached = None, []
+    # ⓪ 元素缓存：上次成功的选择器先试一次，失败立即回退正常扫描
+    if cached:
+        for frame in page.frames:
+            for sel in cached:
+                try:
+                    loc = frame.locator(sel).first
+                    if await loc.count() == 0 or not await loc.is_visible():
+                        continue
+                    await loc.scroll_into_view_if_needed(timeout=2000)
+                    try:
+                        cache_mod.hit(cache_scope, cache_key, sel)
+                    except Exception:
+                        pass
+                    print(f"  [i] {label}: 命中缓存选择器 {sel}")
+                    log_audit(f"{label}缓存命中: {sel}")
+                    return frame, loc
+                except Exception:
+                    continue
+        for sel in cached:
+            try:
+                cache_mod.miss(cache_scope, cache_key, sel)
+            except Exception:
+                pass
     while True:
         # ① CSS 选择器（主页面 + 所有 iframe / 嵌套 iframe）
         for frame in page.frames:
@@ -166,6 +205,11 @@ async def find_clickable(page: Page, selectors: Sequence[str], keywords: Sequenc
                     if label:
                         print(f"  [i] {label}: 命中选择器 {sel}")
                         log_audit(f"{label}选择器: {sel}")
+                        if cache_mod is not None:
+                            try:
+                                cache_mod.remember(cache_scope, cache_key, sel)
+                            except Exception:
+                                pass
                     return frame, loc
                 except Exception:
                     continue
@@ -3307,6 +3351,20 @@ async def _fill_accept_system_pick(page: Page, text: str = "接受系统点选")
                     continue
     print("  [!] 未找到提交行的处理意见输入框，请人工确认是否需要填写『接受系统点选』")
     return False
+
+
+@register_step(desc="采集低碳信息列表（只采集，不改变报价流程）", outputs=["low_carbon_parts"])
+async def step_loss_collect_low_carbon(page: Page, context: dict, **kwargs) -> list:
+    """读取「低碳信息」列表并落库；为空/失败都只记录，不影响主流程"""
+    try:
+        from bot.intelligence import low_carbon
+        items = await low_carbon.collect(page, context.get("claim_no", ""))
+    except Exception as exc:
+        print(f"  [!] 低碳信息采集失败（忽略）: {exc}")
+        log_run(f"低碳信息采集失败（忽略）: {exc}")
+        items = []
+    context["low_carbon_parts"] = items
+    return items
 
 
 @register_step(desc="直供价非 0 → 切换价格类型取消直供价 + 保存 + 接受系统点选",
