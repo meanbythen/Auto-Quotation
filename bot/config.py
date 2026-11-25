@@ -33,6 +33,10 @@ else:
 INTELLIGENCE_MODE = os.environ.get("BOT_INTELLIGENCE_MODE", "advise").strip().lower()
 INTELLIGENCE_AUTO_THRESHOLD = 0.80
 INTELLIGENCE_CONFIRM_THRESHOLD = 0.55
+# 模型输出的概率尺度与规则不同，auto 模式单独设阈值
+INTELLIGENCE_MODEL_AUTO_THRESHOLD = float(os.environ.get("BOT_INTELLIGENCE_MODEL_AUTO", "0.70"))
+# auto 模式是否允许「等待资料 / 无需处理」直接跳过本案件
+INTELLIGENCE_AUTO_SKIP_HOLD = os.environ.get("BOT_INTELLIGENCE_AUTO_SKIP", "1").strip() == "1"
 INTELLIGENCE_COLLECT = True          # 挂机随单采集语料
 INTELLIGENCE_SOURCE = "hang"
 # 意见列表通常异步渲染，读取采用有界轮询

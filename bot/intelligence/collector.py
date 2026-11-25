@@ -101,6 +101,58 @@ def export_jsonl(out_path: Optional[Path] = None) -> Optional[Path]:
     return out_path
 
 
+def record_label(corpus_id: int, action: str, labeler: str = "human",
+                 confidence: float = 1.0, note: str = "") -> bool:
+    """记录人工确认/修正后的标签"""
+    try:
+        return _store().add_opinion_label(corpus_id, action, labeler, confidence, note)
+    except Exception as exc:
+        log_error("写入意见标签失败", exc)
+        return False
+
+
+def stats() -> dict:
+    try:
+        return _store().opinion_stats()
+    except Exception:
+        return {"corpus": 0, "labels": 0, "predictions": 0,
+                "rule_hits": 0, "rule_hit_rate": 0.0}
+
+
+def export_training_set(out_path: Optional[Path] = None) -> Optional[Path]:
+    """导出已标注语料为训练集 JSONL；无标签时返回 None"""
+    try:
+        rows = _store().iter_labeled_corpus()
+    except Exception as exc:
+        log_error("读取意见标签失败", exc)
+        return None
+    if not rows:
+        return None
+    if out_path is None:
+        folder = app_data_dir() / "intelligence" / "training"
+        folder.mkdir(parents=True, exist_ok=True)
+        out_path = folder / f"train_{datetime.now():%Y%m%d}.jsonl"
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        for row in rows:
+            text = " ".join(str(row.get(k) or "") for k in
+                            ("opinion", "opinion_note", "return_eval")).strip()
+            f.write(json.dumps({
+                "text": text,
+                "action": row.get("action"),
+                "labeler": row.get("labeler"),
+                "claim_no": row.get("claim_no"),
+                "publish_time": row.get("publish_time"),
+            }, ensure_ascii=False) + "\n")
+    return out_path
+
+
 if __name__ == "__main__":
-    p = export_jsonl()
-    print(f"导出 {corpus_count()} 条语料 → {p}")
+    s = stats()
+    print(f"语料 {s['corpus']} 条 / 标签 {s['labels']} 条 / 判断 {s['predictions']} 次"
+          f" / 规则命中率 {s['rule_hit_rate'] * 100:.1f}%")
+    print(f"语料导出 → {export_jsonl()}")
+    train = export_training_set()
+    print(f"训练集导出 → {train or '暂无已标注样本'}")
+

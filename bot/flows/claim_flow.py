@@ -328,16 +328,32 @@ async def run_claim_flow(env, ctx: dict, result: Optional[BotRunResult] = None,
                 raise
         ctx["quote_page"] = quote_page
 
-    # ==================== STEP 1.5: 读取报价处理意见（P0 只建议不执行） ====================
+    # ==================== STEP 1.5: 读取报价处理意见并判断 ====================
     async with rec.step("STEP 1.5", STEP_NAMES["STEP 1.5"]):
-        await gate.checkpoint("STEP 1.5 读取报价处理意见并判断（只建议）")
+        await gate.checkpoint("STEP 1.5 读取报价处理意见并判断")
         decision = await step_read_opinion_and_decide(quote_page, ctx)
-        if decision.get("action") and decision["action"] != "unknown":
-            advice = (f"意见判断={decision.get('label')}"
+        decided = decision.get("decided_action") or decision.get("action")
+        if decided and decided != "unknown":
+            advice = (f"意见判断={decision.get('decided_label') or decision.get('label')}"
                       f"（置信度{float(decision.get('confidence') or 0):.2f}）")
             ctx["opinion_advice_note"] = advice
             result.messages.append(advice)
-            print(f"  🧠 建议动作: {advice}（P0 仅记录，不改变执行）")
+            note = "已自动执行" if decision.get("executed") else "仅记录，不改变执行"
+            print(f"  🧠 建议动作: {advice}（{note}）")
+        elif decision.get("overridden_by") == "human_skip":
+            print("  🧠 人工未确认本单意见 → 未记录建议动作")
+
+    # auto 模式高置信判定为「等待资料 / 无需处理」→ 不进入后续报价流程
+    if ctx.get("opinion_skip_claim"):
+        advice = ctx.get("opinion_advice_note") or "意见判断：等待资料 / 无需处理"
+        print(f"\n  ⏭ 按意见自动跳过该案件：{advice}")
+        log_audit(f"按意见自动跳过 | {claim_no} | {advice}")
+        result.status = "skipped"
+        result.messages.append(f"按意见自动跳过：{advice}")
+        for code in ("STEP 2", "STEP 3", "STEP 4", "STEP 5",
+                     "STEP 6", "STEP 7", "STEP 8", "STEP 9"):
+            rec.mark(code, "skipped", reason="意见判断：等待资料 / 无需处理")
+        return "skip_by_opinion"
 
     async with rec.step("STEP 2", STEP_NAMES["STEP 2"]) as st:
         await gate.checkpoint("STEP 2 报价处理 → 点编辑打开定损平台")

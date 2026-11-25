@@ -89,6 +89,22 @@ MODE_HINTS = {
     "manual":    "你自己在浏览器里操作，程序逐步校验，并与自动执行结果对比",
 }
 
+# ============== 智能意见判断模式（P1：确认模式收集中置信度样本）==============
+INTEL_OPTIONS = [
+    ("off",     "关闭"),
+    ("advise",  "建议"),
+    ("confirm", "确认"),
+    ("auto",    "自动"),
+]
+INTEL_LABELS = dict(INTEL_OPTIONS)
+INTEL_KEYS = {v: k for k, v in INTEL_OPTIONS}
+INTEL_HINTS = {
+    "off":     "不读取报价处理意见，行为与旧版一致",
+    "advise":  "读取最新意见并记录建议动作，不弹窗、不改变执行",
+    "confirm": "高置信直接记录；中置信弹窗人工确认并保存标签；低置信按无法判断记录",
+    "auto":    "高置信自动采用；判定为等待资料/无需处理时自动跳过本单（BOT_INTELLIGENCE_AUTO_SKIP=0 可关），其余动作按默认流程继续",
+}
+
 
 class _StreamLogRedirector(io.TextIOBase):
     """把 print / traceback 同时落到日志文件与当前日志盒
@@ -276,6 +292,14 @@ class App:
         self.market_breaker_var = tk.BooleanVar(value=True)   # 封禁熔断（检测到封禁即停止比价+休眠）
         # 运行模式：四种方式都调用同一套流程逻辑（bot/flows/claim_flow.py）
         self.mode_var = tk.StringVar(value=MODE_LABELS["real_loop"])
+        # 智能意见判断模式（P1：确认模式收集人工标签）
+        self.intel_var = tk.StringVar(
+            value=INTEL_LABELS.get(self._intel_mode_key(), INTEL_LABELS["advise"]))
+        try:
+            from bot.intelligence.confirm import set_handler
+            set_handler(self._ask_opinion_confirm)
+        except Exception as exc:
+            log_system(f"智能意见确认通道注册失败: {exc}")
         # 超出权限补救：平级移交的目标人员（工号-姓名）
         self.transfer_var = tk.StringVar(value=TRANSFER_TARGET_DEFAULT)
         # 浏览器（多浏览器支持：auto/chrome/edge/360/custom）
@@ -582,6 +606,19 @@ class App:
                                         bg=SURFACE, fg=TEXT_DIM, font=("Segoe UI", 8),
                                         anchor="w", justify="left"), 70)
         self.mode_hint.pack(fill="x", padx=34, pady=(0, 10))
+
+        rintel = tk.Frame(card, bg=SURFACE); rintel.pack(fill="x", padx=14, pady=(0, 3))
+        tk.Label(rintel, text="智能意见", bg=SURFACE, fg=TEXT_MUTED,
+                 font=("Segoe UI Semibold", 9), width=10, anchor="w").pack(side="left")
+        self.intel_combo = ttk.Combobox(rintel, textvariable=self.intel_var, state="readonly",
+                                        width=16, values=[v for _, v in INTEL_OPTIONS],
+                                        font=("Segoe UI", 9))
+        self.intel_combo.pack(side="left", ipady=1)
+        self.intel_combo.bind("<<ComboboxSelected>>", lambda e: self._on_intel_change())
+        self.intel_hint = _wrap(tk.Label(card, text=INTEL_HINTS.get(self._intel_mode_key(), ""),
+                                         bg=SURFACE, fg=TEXT_DIM, font=("Segoe UI", 8),
+                                         anchor="w", justify="left"), 70)
+        self.intel_hint.pack(fill="x", padx=34, pady=(0, 10))
         # 从别的页面切回来时，恢复真实状态
         self._set_status(*self._status_value)
         self.start_btn.configure(state="disabled" if self.is_running else "normal")
@@ -2700,6 +2737,121 @@ class App:
             }, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as exc:
             log_system(f"保存界面设置失败: {exc}")
+
+    # ---------- 智能意见：模式切换与人工确认 ----------
+    def _intel_mode_key(self) -> str:
+        key = "advise"
+        try:
+            from bot.pricing import get_price_service
+            saved = (get_price_service().store.get_setting("intelligence_mode", "") or "").strip()
+            if saved in INTEL_LABELS:
+                key = saved
+        except Exception:
+            pass
+        return key
+
+    def _on_intel_change(self):
+        key = INTEL_KEYS.get((self.intel_var.get() or "").strip(), "advise")
+        try:
+            from bot.pricing import get_price_service
+            get_price_service().store.set_setting("intelligence_mode", key)
+        except Exception as exc:
+            log_system(f"保存智能意见模式失败: {exc}")
+        try:
+            self.intel_hint.configure(text=INTEL_HINTS.get(key, ""))
+        except Exception:
+            pass
+        log_system(f"智能意见模式: {key}（{INTEL_LABELS.get(key, '')}）")
+
+    def _ask_opinion_confirm(self, payload: dict, timeout: float = 120.0):
+        """后台线程调用：切到 Tk 主线程弹窗，阻塞等待人工选择"""
+        done = threading.Event()
+        box = {}
+
+        def _show():
+            try:
+                box["v"] = self._opinion_confirm_dialog(payload)
+            except Exception as exc:
+                log_system(f"意见确认对话框异常: {exc}")
+                box["v"] = None
+            finally:
+                done.set()
+
+        try:
+            self.root.after(0, _show)
+        except Exception:
+            return None
+        if not done.wait(max(5.0, float(timeout))):
+            log_system("意见确认等待超时，按未确认处理")
+            return None
+        return box.get("v")
+
+    def _opinion_confirm_dialog(self, payload: dict):
+        try:
+            from bot.intelligence import LABELS as ACTION_LABELS
+        except Exception:
+            ACTION_LABELS = {}
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("意见动作确认")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        body = tk.Frame(dlg, bg=SURFACE, padx=16, pady=12)
+        body.pack(fill="both", expand=True)
+
+        tk.Label(body, text=f"报案号 {payload.get('claim_no') or ''}", bg=SURFACE, fg=TEXT,
+                 font=("Segoe UI Semibold", 10), anchor="w").pack(fill="x")
+        tk.Label(body, text=f"最新意见：{payload.get('opinion_text') or '无'}",
+                 bg=SURFACE, fg=TEXT_MUTED, font=("Segoe UI", 9),
+                 wraplength=520, justify="left", anchor="w").pack(fill="x", pady=(6, 8))
+
+        suggested = str(payload.get("suggested") or "unknown")
+        conf = float(payload.get("confidence") or 0.0)
+        tk.Label(body, text=f"程序建议：{ACTION_LABELS.get(suggested, suggested)}"
+                            f"（置信度 {conf:.2f}）",
+                 bg=SURFACE, fg=WARNING, font=("Segoe UI", 9),
+                 anchor="w").pack(fill="x", pady=(0, 6))
+
+        var = tk.StringVar(value=suggested)
+        options = payload.get("options") or list(ACTION_LABELS.items())
+        grid = tk.Frame(body, bg=SURFACE)
+        grid.pack(fill="x", pady=(0, 6))
+        for i, (key, label) in enumerate(options):
+            tk.Radiobutton(grid, text=label, value=key, variable=var,
+                           bg=SURFACE, fg=TEXT, selectcolor=SURFACE_2,
+                           activebackground=SURFACE, activeforeground=TEXT,
+                           font=("Segoe UI", 9), anchor="w").grid(
+                row=i // 2, column=i % 2, sticky="w", padx=(0, 18), pady=2)
+
+        result = {"v": None}
+
+        def _ok():
+            result["v"] = var.get()
+            dlg.destroy()
+
+        def _skip():
+            result["v"] = None
+            dlg.destroy()
+
+        btns = tk.Frame(body, bg=SURFACE)
+        btns.pack(fill="x", pady=(6, 0))
+        tk.Button(btns, text="确定", bg=SUCCESS, fg="white", relief="flat",
+                  cursor="hand2", padx=14, pady=3,
+                  font=("Segoe UI Semibold", 9), command=_ok).pack(side="right")
+        tk.Button(btns, text="跳过本单", bg=SURFACE_2, fg=TEXT_MUTED, relief="flat",
+                  cursor="hand2", padx=10, pady=3,
+                  font=("Segoe UI", 9), command=_skip).pack(side="right", padx=(0, 8))
+
+        dlg.grab_set()
+        dlg.update_idletasks()
+        try:
+            x = self.root.winfo_x() + max(0, (self.root.winfo_width() - dlg.winfo_width()) // 2)
+            y = self.root.winfo_y() + max(0, (self.root.winfo_height() - dlg.winfo_height()) // 3)
+            dlg.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+        self.root.wait_window(dlg)
+        return result["v"]
 
     def _pick_browser(self):
         from tkinter import filedialog

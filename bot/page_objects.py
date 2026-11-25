@@ -6927,9 +6927,11 @@ async def step_read_opinion_and_decide(page: Page, context: dict, **kwargs) -> d
     """
     claim_no = context.get("claim_no", "")
     try:
-        from bot.intelligence import (decide, enabled, format_opinion,
+        from bot.intelligence import (LABELS, ask_confirm, confirm_available,
+                                      decide, enabled, format_opinion,
                                       mode, read_latest_opinion,
-                                      record_opinion, record_prediction)
+                                      record_label, record_opinion,
+                                      record_prediction)
     except Exception as exc:
         print(f"  [!] 智能意见模块加载失败（不影响主流程）: {type(exc).__name__}: {exc}")
         log_run(f"智能意见模块加载失败: {type(exc).__name__}: {exc}")
@@ -6960,13 +6962,81 @@ async def step_read_opinion_and_decide(page: Page, context: dict, **kwargs) -> d
     corpus_id = 0
     if cfg.INTELLIGENCE_COLLECT:
         corpus_id = record_opinion(claim_no, opinion, source=cfg.INTELLIGENCE_SOURCE)
+
+    # P1/P2：confirm 人工确认；auto 高置信自动采用（仅 hold 类动作可跳过本单）
+    current_mode = mode()
+    decided = decision.action
+    overridden_by = ""
+    executed = False
+    auto_threshold = (cfg.INTELLIGENCE_MODEL_AUTO_THRESHOLD
+                      if decision.source == "model"
+                      else cfg.INTELLIGENCE_AUTO_THRESHOLD)
+
+    if current_mode == "auto" and decision.action != "unknown":
+        if decision.confidence >= auto_threshold:
+            decided = decision.action
+            overridden_by = "auto"
+            if (decision.action in ("wait_material", "no_action")
+                    and cfg.INTELLIGENCE_AUTO_SKIP_HOLD):
+                executed = True
+                context["opinion_skip_claim"] = True
+                print(f"  [✓] auto：{decision.label}（{decision.confidence:.2f}）"
+                      f" → 跳过本案件后续流程")
+            else:
+                print(f"  [i] auto：采用 {decision.label}（{decision.confidence:.2f}），"
+                      f"该动作暂无独立执行路由 → 按默认流程继续")
+        else:
+            decided = "unknown"
+            print(f"  [i] auto：置信度 {decision.confidence:.2f} 低于自动阈值 "
+                  f"{auto_threshold:.2f} → 按「无法判断」记录")
+    elif current_mode == "confirm" and decision.action != "unknown":
+        if decision.confidence >= cfg.INTELLIGENCE_AUTO_THRESHOLD:
+            print(f"  [i] 置信度 {decision.confidence:.2f} ≥ 自动阈值 "
+                  f"{cfg.INTELLIGENCE_AUTO_THRESHOLD:.2f} → 可直接执行（P2 仅 hold 类自动）")
+        elif decision.confidence >= cfg.INTELLIGENCE_CONFIRM_THRESHOLD:
+            if confirm_available():
+                payload = {
+                    "claim_no": claim_no,
+                    "opinion_text": format_opinion(opinion),
+                    "suggested": decision.action,
+                    "confidence": decision.confidence,
+                    "options": list(LABELS.items()),
+                }
+                loop = asyncio.get_running_loop()
+                chosen = await loop.run_in_executor(None, ask_confirm, payload, 120.0)
+                if chosen:
+                    decided = chosen
+                    overridden_by = ("human" if chosen != decision.action
+                                     else "human_confirmed")
+                    if corpus_id:
+                        record_label(corpus_id, chosen, "human", 1.0, "confirm")
+                    print(f"  [✓] 人工确认动作: {LABELS.get(chosen, chosen)}"
+                          f"（{overridden_by}）")
+                else:
+                    decided = "unknown"
+                    overridden_by = "human_skip"
+                    print("  [i] 人工未确认 → 按「无法判断」记录，不执行")
+            else:
+                print("  [i] 当前无确认界面 → 按判断结果记录，不执行")
+        else:
+            decided = "unknown"
+            print(f"  [i] 置信度 {decision.confidence:.2f} 低于确认阈值 "
+                  f"{cfg.INTELLIGENCE_CONFIRM_THRESHOLD:.2f} → 按「无法判断」记录")
+
     record_prediction(claim_no, decision, corpus_id=corpus_id,
-                      decided_action="", executed=False)
+                      decided_action=decided, executed=executed,
+                      overridden_by=overridden_by)
     log_audit(f"意见判断 | {claim_no} | {format_opinion(opinion)} | "
               f"{decision.action}/{decision.label} | 置信度={decision.confidence:.2f} | "
-              f"依据={decision.reason} | 模式={mode()}")
+              f"来源={decision.source} | 决定={decided} | 执行={executed} | "
+              f"依据={decision.reason} | 模式={current_mode}")
 
     data = decision.to_dict()
+    data["decided_action"] = decided
+    data["decided_label"] = LABELS.get(decided, decided)
+    data["overridden_by"] = overridden_by
+    data["executed"] = executed
+    data["mode"] = current_mode
     data["order_uncertain"] = bool(opinion.get("order_uncertain"))
     data["corpus_id"] = corpus_id
     context["opinion_decision"] = data

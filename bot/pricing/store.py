@@ -593,6 +593,83 @@ class PriceStore:
         except sqlite3.Error:
             return False
 
+    # ---------- 意见人工标签 / 统计 ----------
+    def add_opinion_label(self, corpus_id: int, action: str, labeler: str = "human",
+                          confidence: float = 1.0, note: str = "") -> bool:
+        """写入/覆盖一条人工标签（同一语料只保留最后一次）"""
+        if self._conn is None or int(corpus_id or 0) <= 0:
+            return False
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO opinion_label"
+                    "(corpus_id, action, confidence, labeler, labeled_at, note)"
+                    " VALUES(?,?,?,?,?,?)",
+                    (int(corpus_id), str(action or "unknown"),
+                     float(confidence or 1.0), str(labeler or "human"),
+                     _iso(_now()), str(note or "")))
+                self._conn.commit()
+            return True
+        except sqlite3.Error:
+            return False
+
+    def count_opinion_labels(self) -> int:
+        if self._conn is None:
+            return 0
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) FROM opinion_label").fetchone()
+            return int(row[0]) if row else 0
+        except sqlite3.Error:
+            return 0
+
+    def iter_labeled_corpus(self) -> list[dict]:
+        """训练集导出：已有标签的语料（含意见原文与标签）"""
+        if self._conn is None:
+            return []
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT c.claim_no, c.staff_code, c.org_name, c.publish_time,"
+                    " c.opinion, c.opinion_note, c.return_eval, c.submit_path,"
+                    " l.action, l.labeler, l.confidence"
+                    " FROM opinion_corpus c JOIN opinion_label l ON l.corpus_id = c.id"
+                    " ORDER BY l.labeled_at DESC").fetchall()
+        except sqlite3.Error:
+            return []
+        keys = ("claim_no", "staff_code", "org_name", "publish_time", "opinion",
+                "opinion_note", "return_eval", "submit_path", "action",
+                "labeler", "confidence")
+        return [dict(zip(keys, r)) for r in rows]
+
+    def opinion_stats(self) -> dict:
+        """采集/判断概况：语料数、标签数、判断数、规则命中率"""
+        result = {"corpus": 0, "labels": 0, "predictions": 0,
+                  "rule_hits": 0, "rule_hit_rate": 0.0}
+        if self._conn is None:
+            return result
+        try:
+            with self._lock:
+                corpus = self._conn.execute(
+                    "SELECT COUNT(*) FROM opinion_corpus").fetchone()
+                labels = self._conn.execute(
+                    "SELECT COUNT(*) FROM opinion_label").fetchone()
+                pred = self._conn.execute(
+                    "SELECT COUNT(*),"
+                    " SUM(CASE WHEN action <> 'unknown' THEN 1 ELSE 0 END)"
+                    " FROM opinion_prediction").fetchone()
+        except sqlite3.Error:
+            return result
+        result["corpus"] = int(corpus[0]) if corpus else 0
+        result["labels"] = int(labels[0]) if labels else 0
+        result["predictions"] = int(pred[0]) if pred else 0
+        result["rule_hits"] = int(pred[1] or 0) if pred else 0
+        if result["predictions"]:
+            result["rule_hit_rate"] = round(
+                result["rule_hits"] / result["predictions"], 4)
+        return result
+
     # ---------- 因蓝色/纯橙色退回过的报案号（二次进入按正常案件处理） ----------
     def claim_color_returned_before(self, claim_no: str) -> bool:
         claim_no = (claim_no or "").strip().upper()

@@ -344,6 +344,29 @@ async def _loop_body(env, spec: EnvSpec, *,
                     except Exception:
                         pass
                 await asyncio.sleep(2)
+            elif route == "skip_by_opinion":
+                processed_count += 1
+                _mark_processed(claim)
+                all_results.append(result)
+                result.status = "skipped"
+                skipped_count += 1
+                note = (ctx.get("opinion_advice_note")
+                        or "意见判断：等待资料 / 无需处理")
+                skipped_list.append((claim, "STEP 1.5", note))
+                write_ledger(claim, result.vehicle, result.parts,
+                             status="skipped", note=f"{note} → 按意见跳过该报案",
+                             skip_step="STEP 1.5")
+                finalize_record(rec, status="skipped", route=route,
+                                data=snapshot(ctx, result, route))
+                record_skip(claim, "STEP 1.5", note)
+                print(f"\n  ⏭ #{processed_count} {claim} 按意见跳过：{note}")
+                log_run(f"#{processed_count} {claim} 按意见跳过 | {note}")
+                if logger:
+                    try:
+                        logger(f"⏭ #{processed_count} {claim} 按意见跳过：{note}")
+                    except Exception:
+                        pass
+                await asyncio.sleep(2)
             else:
                 processed_count += 1
                 _mark_processed(claim)
