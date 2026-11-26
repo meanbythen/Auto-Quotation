@@ -6934,12 +6934,38 @@ async def _quick_link_present(page: Page, timeout: float = 10.0) -> bool:
         await asyncio.sleep(0.4)
 
 
+async def _quote_page_ready(page: Page, timeout: float = 10.0) -> bool:
+    """等报价处理页渲染出业务动作下拉/意见区/报案号框（新标签页首帧常是空白）"""
+    deadline = time.monotonic() + max(0.5, timeout)
+    while time.monotonic() < deadline:
+        try:
+            if page.is_closed():
+                return False
+        except Exception:
+            return False
+        for fr in page.frames:
+            try:
+                if await fr.locator(
+                        ".quote-opinion, .el-form-item:has-text('业务动作'),"
+                        " #submit-quote-btn, input[placeholder*='报案号']").count() > 0:
+                    return True
+            except Exception:
+                continue
+        await asyncio.sleep(0.3)
+    return False
+
+
 async def _quote_click_quick_process(page: Page) -> Optional[Page]:
     """提交上级后的『系统提示』弹窗 → 快速链接专栏 → 点『处理』
 
     之前本工号处理过的报案号，提交上级后会弹「系统提示」，
     下方快速链接专栏里有『处理』按钮：点了就回到本人的报价处理页（九级报价环节），
     可直接报价完成，不需要再走平级移交。
+
+    生产实测（2026-11-26）：提交上级成功后平台常自动关闭原报价 tab，
+    点『处理』打开的报价页若超过 2.5 秒才出现，旧代码会把**已关闭的旧页**
+    当成报价页继续操作 → 下一步抛 Target page, context or browser has been closed。
+    因此这里改为轮询 context.pages（谁新、谁活着就用谁），绝不返回已关闭的页面。
     """
     if not await _quick_link_present(page, timeout=10.0):
         info = None
@@ -6950,28 +6976,67 @@ async def _quote_click_quick_process(page: Page) -> Optional[Page]:
         print(f"  [!] 未找到『快速链接专栏 → 处理』（{(info or {}).get('reason', '')}）")
         return None
 
+    try:
+        ctx = page.context
+        before = list(ctx.pages)
+    except Exception as exc:
+        print(f"  [!] 快速链接：取浏览器上下文失败：{type(exc).__name__}: {exc}")
+        return None
+
     loc = page.locator("[data-bot-quick-process='1']").first
     clicked = False
-    try:
-        async with page.expect_popup(timeout=2500) as pop:
-            await loc.click(timeout=4000)
-            clicked = True
-        newp = await pop.value
-        await newp.wait_for_load_state("domcontentloaded")
-        print("  [✓] 已点快速链接『处理』→ 新标签页打开报价处理")
-        log_audit("提交上级后点快速链接『处理』→ 新标签页")
-        return newp
-    except Exception:
-        pass
-    if not clicked:
+    for attempt in (1, 2):
         try:
-            await loc.click(timeout=4000)
+            await loc.click(timeout=5000)
             clicked = True
+            break
         except Exception as exc:
-            print(f"  [!] 『处理』按钮点击失败：{type(exc).__name__}: {exc}")
-            return None
-    await asyncio.sleep(1.5)
-    print("  [✓] 已点快速链接『处理』→ 当前页回到报价处理")
+            print(f"  [!] 『处理』按钮点击失败（第 {attempt} 次）：{type(exc).__name__}: {exc}")
+            await asyncio.sleep(0.6)
+    if not clicked:
+        return None
+
+    deadline = time.monotonic() + 12.0
+    while time.monotonic() < deadline:
+        try:
+            fresh = [p for p in ctx.pages if p not in before and not p.is_closed()]
+        except Exception:
+            fresh = []
+        if fresh:
+            target = fresh[-1]
+            ok = await _quote_page_ready(target)
+            try:
+                await target.bring_to_front()
+                await target.wait_for_load_state("domcontentloaded", timeout=8000)
+            except Exception:
+                pass
+            print(f"  [✓] 已点快速链接『处理』→ 新标签页打开报价处理"
+                  f"（页面就绪={'是' if ok else '超时未就绪'}）")
+            log_audit("提交上级后点快速链接『处理』→ 新标签页")
+            return target
+        try:
+            if page.is_closed():
+                break
+        except Exception:
+            break
+        await asyncio.sleep(0.3)
+
+    closed = False
+    try:
+        closed = page.is_closed()
+    except Exception:
+        closed = True
+    if closed:
+        print("  [!] 快速链接『处理』后原报价页已被平台关闭，且未捕获到新标签页")
+        log_run("快速链接『处理』后原报价页被关闭（平台自动关闭），未捕获到新标签页")
+        return None
+
+    await asyncio.sleep(1.0)
+    if not await _quote_page_ready(page, timeout=6.0):
+        print("  [!] 快速链接『处理』后当前页仍未出现报价处理内容")
+        log_run("快速链接『处理』后当前页未出现报价处理内容")
+        return None
+    print("  [✓] 已点快速链接『处理』→ 当前页刷新为报价处理")
     log_audit("提交上级后点快速链接『处理』→ 当前页")
     return page
 
@@ -7143,13 +7208,26 @@ async def step_quote_finalize(page: Page, context: dict, **kwargs) -> None:
             if new_page is not None:
                 page = new_page
                 context["quote_page"] = page
-                context["quick_process_done"] = True
-                after_quick_process = True
                 try:
                     await page.bring_to_front()
                     await page.wait_for_load_state("networkidle", timeout=15000)
                 except Exception:
                     pass
+                alive = True
+                try:
+                    alive = not page.is_closed()
+                except Exception:
+                    alive = False
+                if not alive:
+                    print("  [!] 快速链接打开的报价页已被平台关闭 → 回退平级移交")
+                    log_run("快速链接打开的报价页已被关闭 → 回退平级移交")
+                    context["transfer_back_needed"] = True
+                    return
+                if not await _quote_page_ready(page, timeout=10.0):
+                    print("  [!] 报价页内容未就绪 → 已等待 10 秒，仍按报价完成继续尝试")
+                    log_run("快速链接报价页内容未就绪（等待 10 秒）")
+                context["quick_process_done"] = True
+                after_quick_process = True
                 await asyncio.sleep(1.0)
                 print("  🔁 已在九级报价环节 → 业务动作改『报价完成』继续提交")
             else:
